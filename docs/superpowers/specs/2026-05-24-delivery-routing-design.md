@@ -160,6 +160,7 @@ class Dispatcher(Protocol):
         self,
         state: DriverState,
         candidate: Order,
+        all_orders: dict[int, Order],  # 用於演算法查 order.food_ready_time / place_time
         dist: "DistanceMatrix",
     ) -> Decision: ...
 ```

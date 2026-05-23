@@ -13,15 +13,22 @@ def render_route_html(
     algorithm_name: str,
     out_path: Path,
 ) -> None:
-    """畫出一個演算法的 event log + summary 在 Folium 地圖上。"""
-    # 算地圖中心 = graph 所有節點座標平均
+    """畫出一個演算法的路線與 event log。
+
+    路線：取 event_log 中 kind in {pickup, dropoff} 的點按時序連線。
+    Marker：pickup=藍、dropoff=綠、accept=紫、reject=紅。
+    """
     lats = [data["y"] for _, data in graph.nodes(data=True)]
     lons = [data["x"] for _, data in graph.nodes(data=True)]
     center = (sum(lats) / len(lats), sum(lons) / len(lons))
 
     fmap = folium.Map(location=center, zoom_start=16, tiles="OpenStreetMap")
 
-    # 標題與指標
+    # Summary 卡片
+    avg_ms = (
+        sum(result.dispatcher_decision_ms) / len(result.dispatcher_decision_ms)
+        if result.dispatcher_decision_ms else 0.0
+    )
     summary_html = (
         f"<h3>{algorithm_name}</h3>"
         f"<p>Accepted: {len(result.accepted_orders)} | "
@@ -29,26 +36,44 @@ def render_route_html(
         f"Driver time: {result.driver_time_total:.0f}s | "
         f"Customer wait: {result.customer_wait_total:.0f}s<br>"
         f"Total cost: {result.total_cost:.0f} | "
-        f"Avg decision: "
-        f"{(sum(result.dispatcher_decision_ms) / len(result.dispatcher_decision_ms)) if result.dispatcher_decision_ms else 0:.2f} ms</p>"
+        f"Avg decision: {avg_ms:.2f} ms</p>"
     )
     folium.Marker(
         center,
-        icon=folium.DivIcon(html=f'<div style="background:white;padding:6px;border:1px solid #444;width:280px;">{summary_html}</div>'),
+        icon=folium.DivIcon(html=(
+            f'<div style="background:white;padding:6px;border:1px solid #444;'
+            f'width:280px;font-family:sans-serif;font-size:12px;">'
+            f'{summary_html}</div>'
+        )),
     ).add_to(fmap)
 
-    # 把 event log 中的 pickup / dropoff 點標出
     color_for = {"pickup": "blue", "dropoff": "green",
                  "accept": "purple", "reject": "red"}
+
+    # 連線：把 pickup + dropoff 依時序連起來
+    polyline_points: list[tuple[float, float]] = []
     for entry in result.event_log:
-        if entry.kind not in color_for:
+        if entry.kind in ("pickup", "dropoff") and entry.node is not None:
+            data = graph.nodes[entry.node]
+            polyline_points.append((data["y"], data["x"]))
+    if len(polyline_points) >= 2:
+        folium.PolyLine(
+            polyline_points, color="darkblue", weight=3, opacity=0.7
+        ).add_to(fmap)
+
+    # 各事件 marker
+    for entry in result.event_log:
+        if entry.kind not in color_for or entry.node is None:
             continue
+        data = graph.nodes[entry.node]
+        lat, lon = data["y"], data["x"]
         folium.CircleMarker(
-            center,  # event_log 不含座標；簡化版打在中心，後續可擴充
-            radius=4,
+            (lat, lon),
+            radius=6,
             color=color_for[entry.kind],
             fill=True,
-            popup=f"t={entry.timestamp:.0f}s {entry.kind} {entry.detail}",
+            fill_opacity=0.8,
+            popup=f"t={entry.timestamp:.0f}s {entry.kind}<br>{entry.detail}",
         ).add_to(fmap)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

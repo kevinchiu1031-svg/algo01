@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--lambda-per-min", type=float, default=0.5,
-                   help="訂單到達率（每分鐘）；0.5 ≈ 30 單/小時")
+                   help="訂單到達率（每分鐘）；0.5 約 30 單/小時")
     p.add_argument("--duration", type=float, default=3600.0,
                    help="模擬時長（秒）；預設 1 小時")
     p.add_argument("--tolerance", type=float, default=480.0,
@@ -91,7 +91,7 @@ def main() -> None:
         render_route_html(graph, result, d.name, out_path)
         print(f"      {d.name}: accepted={len(result.accepted_orders)} "
               f"rejected={len(result.rejected_orders)} "
-              f"cost={result.total_cost:.0f} → {out_path}")
+              f"cost={result.total_cost:.0f} -> {out_path}")
 
     comparison_path = out_dir / "comparison.html"
     render_comparison_html(results, comparison_path)

@@ -30,9 +30,9 @@ def test_render_route_html_creates_file(tmp_path: Path):
         total_cost=120.0,
         dispatcher_decision_ms=[1.5],
         event_log=[
-            EventLogEntry(0.0, "accept", "order 1"),
-            EventLogEntry(20.0, "pickup", "order 1 (wait 0s)"),
-            EventLogEntry(60.0, "dropoff", "order 1 (cust_wait 60s)"),
+            EventLogEntry(0.0, "accept", "order 1", node=0),
+            EventLogEntry(20.0, "pickup", "order 1 (wait 0s)", node=10),
+            EventLogEntry(60.0, "dropoff", "order 1 (cust_wait 60s)", node=20),
         ],
     )
     out = tmp_path / "route.html"

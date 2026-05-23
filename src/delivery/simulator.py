@@ -35,6 +35,7 @@ class EventLogEntry:
     timestamp: float
     kind: str
     detail: str
+    node: int | None = None
 
 
 @dataclass
@@ -135,7 +136,8 @@ class Simulator:
                     rejected.append(order.id)
                     event_log.append(EventLogEntry(
                         evt.timestamp, "reject",
-                        f"order {order.id} (in_hand full)"))
+                        f"order {order.id} (in_hand full)",
+                        node=state.location_node))
                     continue
                 # 算當前計畫成本與加入新單後成本
                 cost_without, _, _ = cost_of_route(
@@ -147,11 +149,12 @@ class Simulator:
                     state, order, all_orders, self.dist
                 )
                 decision_ms.append((time.perf_counter() - t0) * 1000.0)
-                if decision.new_route is None:
+                if not decision.accept or decision.new_route is None:
                     rejected.append(order.id)
                     event_log.append(EventLogEntry(
                         evt.timestamp, "reject",
-                        f"order {order.id} (dispatcher returned None)"))
+                        f"order {order.id} (dispatcher rejected)",
+                        node=state.location_node))
                     continue
                 cost_with, _, _ = cost_of_route(
                     decision.new_route, state, all_orders, self.dist,
@@ -161,14 +164,16 @@ class Simulator:
                     rejected.append(order.id)
                     event_log.append(EventLogEntry(
                         evt.timestamp, "reject",
-                        f"order {order.id} (cost +{cost_with - cost_without:.1f}s > {self.tolerance})"))
+                        f"order {order.id} (cost +{cost_with - cost_without:.1f}s > {self.tolerance})",
+                        node=state.location_node))
                     continue
                 # 接受：更新 in_hand，重排下一個 arrival
                 state.in_hand = decision.new_route
                 accepted.append(order.id)
                 event_log.append(EventLogEntry(
                     evt.timestamp, "accept",
-                    f"order {order.id} (route len {len(state.in_hand)})"))
+                    f"order {order.id} (route len {len(state.in_hand)})",
+                    node=state.location_node))
                 schedule_next_arrival(state)
 
             elif evt.kind in (EventType.DRIVER_ARRIVED_PICKUP,
@@ -185,14 +190,16 @@ class Simulator:
                     state.current_time += wait  # 等餐
                     event_log.append(EventLogEntry(
                         evt.timestamp, "pickup",
-                        f"order {stop.order_id} (wait {wait:.1f}s)"))
+                        f"order {stop.order_id} (wait {wait:.1f}s)",
+                        node=stop.node))
                 else:
                     order = all_orders[stop.order_id]
                     cust_wait = state.current_time - order.place_time
                     customer_wait_total += cust_wait
                     event_log.append(EventLogEntry(
                         evt.timestamp, "dropoff",
-                        f"order {stop.order_id} (cust_wait {cust_wait:.1f}s)"))
+                        f"order {stop.order_id} (cust_wait {cust_wait:.1f}s)",
+                        node=stop.node))
                 state.in_hand = state.in_hand[1:]
                 schedule_next_arrival(state)
 
