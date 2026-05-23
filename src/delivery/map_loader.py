@@ -13,19 +13,27 @@ def load_graph(
     network_type: str = "drive",
     cache_dir: Path | str = "data/cache",
 ) -> nx.MultiDiGraph:
-    """從 OSMnx 拉路網。若 cache 已存在則直接讀。"""
+    """從 OSMnx 拉路網，只保留最大 strongly-connected component（避免 random 顧客取到孤立節點）。"""
     import osmnx as ox  # 延遲 import，避免單元測試啟動時碰網路套件
 
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{place.replace(' ', '_').replace(',', '')}_{dist_meters}_{network_type}.graphml"
     if cache_file.exists():
-        return ox.load_graphml(cache_file)
-    # OSMnx 1.9+：geocode + graph_from_point
-    point = ox.geocode(place)
-    g = ox.graph_from_point(point, dist=dist_meters, network_type=network_type)
-    ox.save_graphml(g, cache_file)
-    return g
+        g = ox.load_graphml(cache_file)
+    else:
+        point = ox.geocode(place)
+        g = ox.graph_from_point(point, dist=dist_meters, network_type=network_type)
+        ox.save_graphml(g, cache_file)
+    return _largest_strongly_connected(g)
+
+
+def _largest_strongly_connected(g: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """取最大 strongly-connected component；保留 node attributes（含 amenity、x/y 座標）。"""
+    if nx.is_strongly_connected(g):
+        return g
+    largest = max(nx.strongly_connected_components(g), key=len)
+    return g.subgraph(largest).copy()
 
 
 def make_distance_matrix(

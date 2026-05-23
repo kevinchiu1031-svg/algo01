@@ -141,7 +141,9 @@ def _held_karp(
     best_cost = float("inf")
     for last in range(n):
         cell = dp.get((full_mask, last))
-        if cell is not None and cell.accumulated_cost < best_cost:
+        if cell is None:
+            continue
+        if best_last == -1 or cell.accumulated_cost < best_cost:
             best_cost = cell.accumulated_cost
             best_last = last
     if best_last == -1:

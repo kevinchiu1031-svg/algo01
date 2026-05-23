@@ -248,15 +248,15 @@ class Simulator:
 ## 10. 接受／拒絕規則（共用，演算法不負責）
 
 ```
-cost_without = cost_of_route(state.in_hand, state, dist)
-cost_with    = cost_of_route(new_route,    state, dist)  # new_route 來自 dispatcher
+cost_with_driver_time    = driver_time component of cost_of_route(new_route, state, dist)
+cost_without_driver_time = driver_time component of cost_of_route(state.in_hand, state, dist)
 accept = (
-    len(orders_in_hand) < 3                              # 硬限制
-    and cost_with < cost_without + tolerance             # 軟限制
+    len(orders_in_hand) < 3                                    # 硬限制
+    and (cost_with_driver_time - cost_without_driver_time) < tolerance   # 軟限制
 )
 ```
 
-`tolerance` 預設 **480 秒（8 分鐘）**，意即接這單造成的總成本上升不得超過 8 分鐘等價成本。亦作為實驗變因之一，可在 `run_experiment.py` 用 CLI 旗標覆寫。
+`tolerance` 預設 **480 秒（8 分鐘）**，意即接這單造成的**外送員額外駕駛時間**不超過 8 分鐘。不計顧客等待時間（顧客等待天生較長，若計入會幾乎全拒）。亦作為實驗變因之一，可在 `run_experiment.py` 用 CLI 旗標覆寫。
 
 ## 11. 成本函數與指標
 

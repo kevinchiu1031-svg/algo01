@@ -139,8 +139,8 @@ class Simulator:
                         f"order {order.id} (in_hand full)",
                         node=state.location_node))
                     continue
-                # 算當前計畫成本與加入新單後成本
-                cost_without, _, _ = cost_of_route(
+                # 算當前計畫駕駛時間與加入新單後駕駛時間（tolerance 只計 driver_time）
+                _, driver_without, _ = cost_of_route(
                     state.in_hand, state, all_orders, self.dist,
                     self.alpha, self.beta,
                 )
@@ -156,15 +156,15 @@ class Simulator:
                         f"order {order.id} (dispatcher rejected)",
                         node=state.location_node))
                     continue
-                cost_with, _, _ = cost_of_route(
+                _, driver_with, _ = cost_of_route(
                     decision.new_route, state, all_orders, self.dist,
                     self.alpha, self.beta,
                 )
-                if cost_with > cost_without + self.tolerance:
+                if driver_with - driver_without > self.tolerance:
                     rejected.append(order.id)
                     event_log.append(EventLogEntry(
                         evt.timestamp, "reject",
-                        f"order {order.id} (cost +{cost_with - cost_without:.1f}s > {self.tolerance})",
+                        f"order {order.id} (driver +{driver_with - driver_without:.1f}s > {self.tolerance})",
                         node=state.location_node))
                     continue
                 # 接受：更新 in_hand，重排下一個 arrival
