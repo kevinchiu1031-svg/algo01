@@ -60,7 +60,10 @@ def test_dp_is_oracle_vs_greedy_and_approx(dist_factory):
 def test_dp_route_respects_precedence(dist_factory):
     o1 = Order(1, 10, 11, place_time=0, prep_time=0)
     o2 = Order(2, 20, 21, place_time=0, prep_time=0)
-    state = DriverState(location_node=0, current_time=0.0, in_hand=[])
+    state = DriverState(
+        location_node=0, current_time=0.0,
+        in_hand=[Stop(1, "pickup", 10), Stop(1, "dropoff", 11)],
+    )
     dist = dist_factory({
         (0, 10): 10, (0, 11): 5, (0, 20): 100, (0, 21): 90,
         (10, 11): 8, (10, 20): 50, (10, 21): 60,

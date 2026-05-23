@@ -31,13 +31,10 @@ class DpDispatcher:
         all_orders: dict[int, Order],
         dist: DistanceMatrix,
     ) -> Decision:
-        # Build stops from all_orders so the DP plans the full remaining route.
-        # This ensures every order (including those not yet in state.in_hand)
-        # appears in the route exactly once as pickup then dropoff.
-        stops: list[Stop] = []
-        for order in all_orders.values():
-            stops.append(Stop(order.id, "pickup", order.restaurant_node))
-            stops.append(Stop(order.id, "dropoff", order.customer_node))
+        stops: list[Stop] = list(state.in_hand) + [
+            Stop(candidate.id, "pickup", candidate.restaurant_node),
+            Stop(candidate.id, "dropoff", candidate.customer_node),
+        ]
         route = _held_karp(
             stops, state, all_orders, dist, self.alpha, self.beta
         )
