@@ -25,15 +25,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--lambda-per-min", type=float, default=0.5,
-                   help="order arrival rate (per minute); 0.5 = ~30 orders/hour")
+                   help="訂單到達率（每分鐘）；0.5 ≈ 30 單/小時")
     p.add_argument("--duration", type=float, default=3600.0,
-                   help="simulation duration (seconds); default 1 hour")
+                   help="模擬時長（秒）；預設 1 小時")
     p.add_argument("--tolerance", type=float, default=480.0,
-                   help="acceptance cost tolerance (seconds); default 480")
+                   help="接單成本容忍門檻（秒）；預設 480")
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=1.0)
     p.add_argument("--speed", type=float, default=5.0,
-                   help="courier average speed (m/s); default 5")
+                   help="外送員平均速度（m/s）；預設 5")
     p.add_argument("--place", type=str,
                    default="Tatung University, Taipei, Taiwan")
     p.add_argument("--dist-meters", type=int, default=1500)
