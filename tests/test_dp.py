@@ -76,3 +76,27 @@ def test_dp_route_respects_precedence(dist_factory):
         positions = [i for i, s in enumerate(route) if s.order_id == oid]
         kinds = [route[i].kind for i in positions]
         assert kinds == ["pickup", "dropoff"]
+
+
+def test_dp_handles_dropoff_only_in_hand(dist_factory):
+    """Simulator 完成 pickup 後，state.in_hand 只剩該單的 dropoff；
+    新單進來時不應該 crash。"""
+    o1 = Order(id=1, restaurant_node=10, customer_node=11, place_time=0, prep_time=0)
+    o2 = Order(id=2, restaurant_node=20, customer_node=21, place_time=0, prep_time=0)
+    state = DriverState(
+        location_node=10,  # 已在 o1 餐廳
+        current_time=100.0,
+        in_hand=[Stop(1, "dropoff", 11)],  # o1 已取餐，剩送達
+    )
+    dist = dist_factory({
+        (10, 11): 50, (10, 20): 100, (10, 21): 150,
+        (11, 20): 80, (11, 21): 130, (20, 21): 60,
+    })
+    disp = DpDispatcher(alpha=1.0, beta=1.0)
+    decision = disp.plan(state, o2, {1: o1, 2: o2}, dist)
+    assert decision.accept is True
+    assert len(decision.new_route) == 3  # o1 dropoff + o2 pickup + o2 dropoff
+    # o2 pickup 必須在 o2 dropoff 之前
+    p2 = next(i for i, s in enumerate(decision.new_route) if s.order_id == 2 and s.kind == "pickup")
+    d2 = next(i for i, s in enumerate(decision.new_route) if s.order_id == 2 and s.kind == "dropoff")
+    assert p2 < d2

@@ -79,21 +79,29 @@ def _mst_preorder(
 
 def _repair_precedence(preorder: list[Stop]) -> list[Stop]:
     """單向修補：從前往後掃，遇到 dropoff 但對應 pickup 還沒出現時，
-    把該 pickup 從後方拉到當前位置之前。"""
+    把該 pickup 從後方拉到當前位置之前。
+
+    若某 order 只有 dropoff 沒有 pickup（pickup 已被 simulator 完成），
+    直接把該 order 視為已 picked_up。"""
     result: list[Stop] = []
     remaining = list(preorder)
-    picked_up: set[int] = set()
+    has_pickup = {s.order_id for s in preorder if s.kind == "pickup"}
+    picked_up: set[int] = {
+        s.order_id for s in preorder
+        if s.kind == "dropoff" and s.order_id not in has_pickup
+    }
     while remaining:
         s = remaining.pop(0)
         if s.kind == "dropoff" and s.order_id not in picked_up:
-            # 找到對應 pickup（必在 remaining 內，因為原序列含所有 stops）
             pickup_idx = next(
-                i for i, t in enumerate(remaining)
-                if t.order_id == s.order_id and t.kind == "pickup"
+                (i for i, t in enumerate(remaining)
+                 if t.order_id == s.order_id and t.kind == "pickup"),
+                None,
             )
-            pickup = remaining.pop(pickup_idx)
-            result.append(pickup)
-            picked_up.add(pickup.order_id)
+            if pickup_idx is not None:
+                pickup = remaining.pop(pickup_idx)
+                result.append(pickup)
+                picked_up.add(pickup.order_id)
         result.append(s)
         if s.kind == "pickup":
             picked_up.add(s.order_id)

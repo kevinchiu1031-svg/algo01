@@ -66,20 +66,33 @@ def _held_karp(
     # dp[mask][last] = _Cell（last 為最後造訪的 stop index）
     dp: dict[tuple[int, int], _Cell] = {}
 
-    # 初始化：從起點直接到每個合法 first stop（必須是 pickup）
+    # 初始化：從起點直接到每個合法 first stop
+    # pickup 一律合法；dropoff 只有在其 pickup 不在 stops 中（已被 simulator 完成）時才合法
     for i, s in enumerate(stops):
-        if s.kind != "pickup":
-            continue
-        travel = dist[(state.location_node, s.node)]
-        arrival = state.current_time + travel
-        order = orders[s.order_id]
-        departure = max(arrival, order.food_ready_time)
-        incr = alpha * (travel + (departure - arrival))
-        dp[(1 << i, i)] = _Cell(
-            elapsed_time=departure - state.current_time,
-            accumulated_cost=incr,
-            prev=-1,
-        )
+        if s.kind == "pickup":
+            travel = dist[(state.location_node, s.node)]
+            arrival = state.current_time + travel
+            order = orders[s.order_id]
+            departure = max(arrival, order.food_ready_time)
+            incr = alpha * (travel + (departure - arrival))
+            dp[(1 << i, i)] = _Cell(
+                elapsed_time=departure - state.current_time,
+                accumulated_cost=incr,
+                prev=-1,
+            )
+        else:
+            # dropoff：只有當其 pickup 不在 stops 中才允許作為 first stop
+            if pickup_idx.get(s.order_id) is None:
+                travel = dist[(state.location_node, s.node)]
+                arrival = state.current_time + travel
+                departure = arrival
+                order = orders[s.order_id]
+                incr = alpha * travel + beta * (arrival - order.place_time)
+                dp[(1 << i, i)] = _Cell(
+                    elapsed_time=departure - state.current_time,
+                    accumulated_cost=incr,
+                    prev=-1,
+                )
 
     # 主迴圈：擴展 mask
     for mask in range(1, full_mask + 1):
@@ -92,10 +105,12 @@ def _held_karp(
             for nxt in range(n):
                 if mask & (1 << nxt):
                     continue
-                # precedence: 若 nxt 是 dropoff，對應 pickup 必須已在 mask
+                # precedence: 若 nxt 是 dropoff，且其 pickup 也在 stops 中，
+                # 則對應 pickup 必須已在 mask（若 pickup 不在 stops，代表已被
+                # simulator 完成，無需檢查）
                 if stops[nxt].kind == "dropoff":
-                    p = pickup_idx[stops[nxt].order_id]
-                    if not (mask & (1 << p)):
+                    p = pickup_idx.get(stops[nxt].order_id)
+                    if p is not None and not (mask & (1 << p)):
                         continue
                 travel = dist[(stops[last].node, stops[nxt].node)]
                 arrival = state.current_time + cell.elapsed_time + travel

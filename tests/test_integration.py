@@ -42,11 +42,13 @@ def toy_geo_graph() -> nx.MultiDiGraph:
 
 def test_end_to_end_all_three_algorithms(toy_geo_graph, tmp_path: Path):
     dist = make_distance_matrix(toy_geo_graph, speed_mps=5.0)
-    # 手寫 3 張單而非用 Poisson，確保可重現；安排充足時間讓前一單完成
+    # 手寫 5 張單而非用 Poisson，確保可重現
     orders = [
         Order(1, 0, 8, place_time=0.0, prep_time=10.0),
-        Order(2, 12, 18, place_time=1000.0, prep_time=20.0),
-        Order(3, 24, 4, place_time=2000.0, prep_time=15.0),
+        Order(2, 12, 18, place_time=30.0, prep_time=20.0),
+        Order(3, 24, 4, place_time=60.0, prep_time=15.0),
+        Order(4, 0, 22, place_time=120.0, prep_time=5.0),
+        Order(5, 12, 6, place_time=180.0, prep_time=30.0),
     ]
     dispatchers = [
         GreedyDispatcher(),

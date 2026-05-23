@@ -32,22 +32,25 @@ def _greedy_order(
     start_node: int,
     dist: DistanceMatrix,
 ) -> list[Stop]:
-    """最近可行鄰居：每步挑距離最近且符合 precedence 的 stop。"""
+    """最近可行鄰居：每步挑距離最近且符合 precedence 的 stop。
+
+    若 stops 中某 order 只有 dropoff 沒有 pickup，代表 pickup 已被 simulator
+    完成，該 order 視為已可 dropoff（pre-populate picked_up）。
+    """
     remaining = list(stops)
-    picked_up: set[int] = set()
+    has_pickup = {s.order_id for s in stops if s.kind == "pickup"}
+    picked_up: set[int] = {
+        s.order_id for s in stops
+        if s.kind == "dropoff" and s.order_id not in has_pickup
+    }
     route: list[Stop] = []
     current = start_node
 
     while remaining:
-        # feasible = 不違反 precedence 的 stops
         feasible = [
             s for s in remaining
             if s.kind == "pickup" or s.order_id in picked_up
         ]
-        if not feasible:
-            # 理論上不會發生（所有 dropoff 對應的 pickup 都還在 remaining 裡）
-            # 防禦性：先做 pickup
-            feasible = [s for s in remaining if s.kind == "pickup"]
         nxt = min(feasible, key=lambda s: dist[(current, s.node)])
         route.append(nxt)
         remaining.remove(nxt)
