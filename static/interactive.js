@@ -1,0 +1,314 @@
+/* interactive.js — 外送路由互動式規劃前端邏輯
+ * 依賴：window.MAP_CONFIG 由 interactive_map.html 注入；Leaflet 已載入
+ */
+
+// ─── 全域狀態 ────────────────────────────────────────────────────────────────
+let clickMode = "pickup";            // "pickup" | "dropoff" | "start"
+let pickupMarkers  = [];             // { marker, lat, lng }
+let dropoffMarkers = [];             // { marker, lat, lng }
+let startMarker    = null;           // { marker, lat, lng } | null
+
+let routePolylines  = [];            // L.Polyline[]
+let snappedMarkers  = [];            // L.CircleMarker[] (snapped 點)
+let highlightedIdx  = -1;            // 目前高亮的演算法 index
+
+const ALGO_COLORS = ["#e67e22", "#2980b9", "#27ae60"];  // greedy, tsp, dp
+
+// ─── Leaflet 地圖初始化 ───────────────────────────────────────────────────────
+const cfg = window.MAP_CONFIG;
+const map = L.map("map").setView([cfg.centerLat, cfg.centerLng], cfg.zoom);
+
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  maxZoom: 19,
+}).addTo(map);
+
+// ─── 工具函式：建立彩色圖示 ───────────────────────────────────────────────────
+function makeIcon(color, label) {
+  return L.divIcon({
+    className: "",
+    html: `<div style="
+      background:${color};
+      border:2px solid rgba(0,0,0,0.35);
+      border-radius:50%;
+      width:22px; height:22px;
+      display:flex; align-items:center; justify-content:center;
+      color:#fff; font-size:10px; font-weight:bold;
+      box-shadow:0 1px 4px rgba(0,0,0,0.4);
+    ">${label}</div>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+    popupAnchor: [0, -14],
+  });
+}
+
+// ─── 更新已佈點計數 ───────────────────────────────────────────────────────────
+function updateCounts() {
+  document.getElementById("count-pickup").textContent = pickupMarkers.length;
+  document.getElementById("count-dropoff").textContent = dropoffMarkers.length;
+}
+
+// ─── 模式切換 ────────────────────────────────────────────────────────────────
+function setMode(mode) {
+  clickMode = mode;
+  document.querySelectorAll(".mode-btn").forEach(b => b.classList.remove("active"));
+  document.getElementById("btn-" + mode).classList.add("active");
+}
+
+// ─── 地圖點擊 ────────────────────────────────────────────────────────────────
+map.on("click", function (e) {
+  const { lat, lng } = e.latlng;
+
+  if (clickMode === "pickup") {
+    const idx = pickupMarkers.length + 1;
+    const m = L.marker([lat, lng], { icon: makeIcon("#e67e22", idx) })
+      .bindPopup(`取餐點 #${idx}`)
+      .addTo(map);
+    pickupMarkers.push({ marker: m, lat, lng });
+    updateCounts();
+  } else if (clickMode === "dropoff") {
+    const idx = dropoffMarkers.length + 1;
+    const m = L.marker([lat, lng], { icon: makeIcon("#2980b9", idx) })
+      .bindPopup(`送餐點 #${idx}`)
+      .addTo(map);
+    dropoffMarkers.push({ marker: m, lat, lng });
+    updateCounts();
+  } else if (clickMode === "start") {
+    // 只允許一個司機起點
+    if (startMarker) {
+      map.removeLayer(startMarker.marker);
+    }
+    const m = L.marker([lat, lng], { icon: makeIcon("#2c3e50", "S") })
+      .bindPopup("司機起點")
+      .addTo(map);
+    startMarker = { marker: m, lat, lng };
+  }
+});
+
+// ─── 清除全部 ────────────────────────────────────────────────────────────────
+function clearAll() {
+  [...pickupMarkers, ...dropoffMarkers].forEach(o => map.removeLayer(o.marker));
+  if (startMarker) map.removeLayer(startMarker.marker);
+  pickupMarkers  = [];
+  dropoffMarkers = [];
+  startMarker    = null;
+  updateCounts();
+  clearRoutes();
+  document.getElementById("results-area").innerHTML =
+    '<p style="color:#aaa; font-size:0.85rem; text-align:center; margin-top:20px;">請在地圖上點擊新增取餐點與送餐點，<br/>再按「⚡ 計算路線」。</p>';
+  hideError();
+}
+
+// ─── 清除路線圖層 ─────────────────────────────────────────────────────────────
+function clearRoutes() {
+  routePolylines.forEach(p => map.removeLayer(p));
+  snappedMarkers.forEach(m => map.removeLayer(m));
+  routePolylines = [];
+  snappedMarkers = [];
+  highlightedIdx = -1;
+}
+
+// ─── 錯誤橫幅 ────────────────────────────────────────────────────────────────
+function showError(msg) {
+  const el = document.getElementById("error-banner");
+  el.textContent = "⚠ " + msg;
+  el.style.display = "block";
+}
+function hideError() {
+  document.getElementById("error-banner").style.display = "none";
+}
+
+// ─── 計算路線（主邏輯） ──────────────────────────────────────────────────────
+async function computeRoute() {
+  hideError();
+
+  if (pickupMarkers.length === 0 || dropoffMarkers.length === 0) {
+    showError("請至少各新增一個取餐點與送餐點。");
+    return;
+  }
+
+  const speedVal = parseFloat(document.getElementById("speed-input").value) || 5.0;
+
+  const payload = {
+    pickups:   pickupMarkers.map(o => [o.lat, o.lng]),
+    dropoffs:  dropoffMarkers.map(o => [o.lat, o.lng]),
+    start:     startMarker ? [startMarker.lat, startMarker.lng] : null,
+    speed_mps: speedVal,
+  };
+
+  // 顯示載入中
+  document.getElementById("loading").classList.add("show");
+
+  let data;
+  try {
+    const resp = await fetch("/api/route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    data = await resp.json();
+  } catch (err) {
+    document.getElementById("loading").classList.remove("show");
+    showError("網路錯誤：" + err.message);
+    return;
+  }
+
+  document.getElementById("loading").classList.remove("show");
+
+  if (!data.ok) {
+    showError(data.error || "未知錯誤");
+    return;
+  }
+
+  renderResults(data);
+}
+
+// ─── 渲染結果 ────────────────────────────────────────────────────────────────
+function renderResults(data) {
+  clearRoutes();
+
+  const { results, analysis, snapped } = data;
+
+  // 繪製路線
+  const bounds = [];
+  results.forEach((r, i) => {
+    if (!r.success || !r.polyline || r.polyline.length === 0) return;
+    const color = ALGO_COLORS[i];
+    const poly = L.polyline(r.polyline, {
+      color,
+      weight: 4,
+      opacity: 0.85,
+    }).addTo(map);
+    routePolylines.push(poly);
+    r.polyline.forEach(pt => bounds.push(pt));
+  });
+
+  // Fit bounds
+  if (bounds.length > 0) {
+    map.fitBounds(L.latLngBounds(bounds), { padding: [30, 30] });
+  }
+
+  // 繪製 snapped 標記（小圓點）
+  const drawSnap = (latlng, color, title) => {
+    const m = L.circleMarker(latlng, {
+      radius: 6,
+      color: "#fff",
+      weight: 2,
+      fillColor: color,
+      fillOpacity: 1,
+    }).bindTooltip(title, { direction: "top", permanent: false }).addTo(map);
+    snappedMarkers.push(m);
+  };
+
+  (snapped.pickups  || []).forEach((pt, i) => drawSnap(pt, "#e67e22", `取餐點 #${i+1} (Snap)`));
+  (snapped.dropoffs || []).forEach((pt, i) => drawSnap(pt, "#2980b9", `送餐點 #${i+1} (Snap)`));
+  if (snapped.start) drawSnap(snapped.start, "#2c3e50", "司機起點 (Snap)");
+
+  // ── 建立 HTML ────────────────────────────────────────────────────────────
+  let html = `<h2>演算法比較</h2>`;
+
+  // 路線圖例
+  html += `<div id="route-legend"><h3>路線圖例</h3>`;
+  results.forEach((r, i) => {
+    if (!r.success) return;
+    html += `
+      <div class="route-legend-item" onclick="highlightRoute(${i})">
+        <div class="route-swatch" style="background:${ALGO_COLORS[i]};"></div>
+        <span>${r.display_name} — ${fmtDist(r.total_distance_m)}</span>
+      </div>`;
+  });
+  html += `</div>`;
+
+  // 演算法比較表格
+  html += `
+    <table id="algo-table">
+      <thead>
+        <tr>
+          <th>演算法</th>
+          <th>總距離</th>
+          <th>預估行駛時間</th>
+          <th>計算時間</th>
+          <th>結果說明</th>
+        </tr>
+      </thead>
+      <tbody>`;
+
+  results.forEach((r, i) => {
+    const distStr = r.success ? fmtDist(r.total_distance_m) : "—";
+    const timeStr = r.success ? fmtTime(r.total_time_s)     : "—";
+    const compStr = r.compute_ms.toFixed(2) + " 毫秒";
+    const resultStr = r.success
+      ? `成功（共 ${r.num_stops} 個停靠點）`
+      : `失敗：${r.error}`;
+    const colorDot = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${ALGO_COLORS[i]};margin-right:5px;"></span>`;
+    html += `
+      <tr onclick="highlightRoute(${i})" id="algo-row-${i}">
+        <td>${colorDot}${r.display_name}</td>
+        <td>${distStr}</td>
+        <td>${timeStr}</td>
+        <td>${compStr}</td>
+        <td>${resultStr}</td>
+      </tr>`;
+  });
+
+  html += `</tbody></table>`;
+
+  // 分析說明
+  html += `
+    <div id="analysis-section">
+      <h3>分析說明</h3>
+      <p id="analysis-text">${escHtml(analysis)}</p>
+    </div>`;
+
+  document.getElementById("results-area").innerHTML = html;
+}
+
+// ─── 路線高亮 ────────────────────────────────────────────────────────────────
+function highlightRoute(idx) {
+  // 重置所有路線樣式
+  routePolylines.forEach((p, i) => {
+    p.setStyle({ weight: 4, opacity: 0.85 });
+    p.bringToBack();
+  });
+
+  // 高亮選取行
+  document.querySelectorAll("#algo-table tbody tr").forEach(tr =>
+    tr.classList.remove("row-active")
+  );
+  const row = document.getElementById(`algo-row-${idx}`);
+  if (row) row.classList.add("row-active");
+
+  // 若已是選取狀態則取消
+  if (highlightedIdx === idx) {
+    highlightedIdx = -1;
+    return;
+  }
+  highlightedIdx = idx;
+
+  // 高亮目標路線
+  if (idx < routePolylines.length) {
+    const p = routePolylines[idx];
+    p.setStyle({ weight: 7, opacity: 1.0 });
+    p.bringToFront();
+    map.fitBounds(p.getBounds(), { padding: [40, 40] });
+  }
+}
+
+// ─── 格式化工具 ──────────────────────────────────────────────────────────────
+function fmtDist(m) {
+  const km = (m / 1000).toFixed(2);
+  return `${Math.round(m)} 公尺（${km} 公里）`;
+}
+
+function fmtTime(s) {
+  const mins = (s / 60).toFixed(1);
+  return `${Math.round(s)} 秒（${mins} 分鐘）`;
+}
+
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}

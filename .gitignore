@@ -10,3 +10,8 @@ venv/
 data/cache/*.graphml
 out/
 *.html
+# 但互動式版本的前端模板需納入版控
+!templates/*.html
+# OSMnx 執行時 HTTP 快取與測試輸出，不納入版控
+cache/
+test_results.txt
