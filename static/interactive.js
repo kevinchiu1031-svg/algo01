@@ -8,7 +8,7 @@ let pickupMarkers  = [];             // { marker, lat, lng }
 let dropoffMarkers = [];             // { marker, lat, lng }
 let startMarker    = null;           // { marker, lat, lng } | null
 
-let routePolylines  = [];            // L.Polyline[]
+let routePolylines  = {};            // {resultsIndex: L.Polyline}
 let snappedMarkers  = [];            // L.CircleMarker[] (snapped 點)
 let highlightedIdx  = -1;            // 目前高亮的演算法 index
 
@@ -101,9 +101,9 @@ function clearAll() {
 
 // ─── 清除路線圖層 ─────────────────────────────────────────────────────────────
 function clearRoutes() {
-  routePolylines.forEach(p => map.removeLayer(p));
+  Object.values(routePolylines).forEach(p => map.removeLayer(p));
   snappedMarkers.forEach(m => map.removeLayer(m));
-  routePolylines = [];
+  routePolylines = {};
   snappedMarkers = [];
   highlightedIdx = -1;
 }
@@ -185,7 +185,7 @@ function renderResults(data) {
       weight: 4,
       opacity: 0.85,
     }).addTo(map);
-    routePolylines.push(poly);
+    routePolylines[i] = poly;
     r.polyline.forEach(pt => bounds.push(pt));
   });
   if (bounds.length > 0) {
@@ -250,8 +250,8 @@ function renderResults(data) {
 
   results.forEach((r, i) => {
     const dash = "—";
-    const orderStr = r.success ? stopOrderStr(r.visited_stops)
-                               : `失敗：${r.error || ""}`;
+    const orderStr = r.success ? escHtml(stopOrderStr(r.visited_stops))
+                               : `失敗：${escHtml(r.error || "")}`;
     const roadStr = r.success ? fmtDist(r.road_distance_m) : dash;
     const apprStr = r.success ? `${Math.round(r.approach_distance_m)} 公尺` : dash;
     const totalStr = r.success ? fmtDist(r.total_distance_m) : dash;
@@ -263,7 +263,7 @@ function renderResults(data) {
     const colorDot = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${ALGO_COLORS[i]};margin-right:5px;"></span>`;
     html += `
       <tr onclick="highlightRoute(${i})" id="algo-row-${i}">
-        <td>${colorDot}${r.display_name}</td>
+        <td>${colorDot}${escHtml(r.display_name)}</td>
         <td style="font-size:0.74rem;">${orderStr}</td>
         <td>${roadStr}</td>
         <td>${apprStr}</td>
@@ -295,7 +295,7 @@ function renderResults(data) {
 // ─── 路線高亮 ────────────────────────────────────────────────────────────────
 function highlightRoute(idx) {
   // 重置所有路線樣式
-  routePolylines.forEach((p, i) => {
+  Object.values(routePolylines).forEach(p => {
     p.setStyle({ weight: 4, opacity: 0.85 });
     p.bringToBack();
   });
@@ -314,9 +314,9 @@ function highlightRoute(idx) {
   }
   highlightedIdx = idx;
 
-  // 高亮目標路線
-  if (idx < routePolylines.length) {
-    const p = routePolylines[idx];
+  // 高亮目標路線（查詢 map 而非陣列，保持 results index 對應）
+  const p = routePolylines[idx];
+  if (p) {
     p.setStyle({ weight: 7, opacity: 1.0 });
     p.bringToFront();
     map.fitBounds(p.getBounds(), { padding: [40, 40] });

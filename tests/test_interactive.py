@@ -7,7 +7,9 @@ import pytest
 
 from delivery.interactive import (
     AlgoResult,
+    _project_to_segment,
     _road_path,
+    _unreached_stops_message,
     build_visited_route,
     chinese_analysis,
     compare_algorithms,
@@ -661,3 +663,280 @@ class TestUnreachable:
         for r in failed:
             assert r.all_stops_visited is False
             assert r.error and any("一" <= ch <= "鿿" for ch in r.error)
+
+
+# ---------------------------------------------------------------------------
+# 11. snap_to_edge 額外回傳 edge_key / t（供邊內幾何切分）
+# ---------------------------------------------------------------------------
+class TestSnapEdgeKeyAndT:
+    def test_snap_returns_edge_key_and_t(self, toy_graph):
+        """snap_to_edge 應額外回傳所選邊的 edge_key 與投影參數 t∈[0,1]，
+        且 approach 應與依 t 線性插值的點一致（u 端 t=0、v 端 t=1）。"""
+        # 點選在節點 0→1 邊中點旁
+        n0, n1 = toy_graph.nodes[0], toy_graph.nodes[1]
+        mid_lat = (n0["y"] + n1["y"]) / 2
+        mid_lng = (n0["x"] + n1["x"]) / 2 + 0.00004
+        snap = snap_to_edge(toy_graph, mid_lat, mid_lng)
+        assert "edge_key" in snap and "t" in snap
+        assert 0.0 <= snap["t"] <= 1.0
+        u = toy_graph.nodes[snap["enter_node"]]
+        v = toy_graph.nodes[snap["exit_node"]]
+        # edge_key 必須是該有向邊上真實存在的平行邊鍵
+        assert snap["edge_key"] in toy_graph[snap["enter_node"]][snap["exit_node"]]
+        # approach ≈ u + t*(v-u)
+        t = snap["t"]
+        assert snap["approach"][0] == pytest.approx(u["y"] + t * (v["y"] - u["y"]), abs=1e-9)
+        assert snap["approach"][1] == pytest.approx(u["x"] + t * (v["x"] - u["x"]), abs=1e-9)
+
+    def test_snap_fallback_node_has_keys(self):
+        """無邊的退化圖：snap_to_edge 退回最近節點時仍含 edge_key/t 鍵（None/0.0）。"""
+        g = nx.MultiDiGraph()
+        g.add_node(0, y=25.0, x=121.0)
+        snap = snap_to_edge(g, 25.001, 121.001)
+        assert snap["edge_key"] is None
+        assert snap["t"] == 0.0
+        assert snap["enter_node"] == snap["exit_node"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 12. 曲線邊幾何：真實 length 切分 + 沿曲線描點（FIX 1）
+# ---------------------------------------------------------------------------
+class TestCurvedEdgeGeometry:
+    def _curved_graph(self):
+        """兩節點間一條向北凸起的曲線邊；真實 length(400) > 直線弦(~200)。"""
+        from shapely.geometry import LineString
+        g = nx.MultiDiGraph()
+        g.add_node(0, y=25.0000, x=121.0000)
+        g.add_node(1, y=25.0000, x=121.0020)
+        fwd = LineString([(121.0000, 25.0000), (121.0010, 25.0010),
+                          (121.0020, 25.0000)])
+        rev = LineString(list(reversed(fwd.coords)))
+        g.add_edge(0, 1, length=400.0, geometry=fwd)
+        g.add_edge(1, 0, length=400.0, geometry=rev)
+        make_distance_matrix(g, speed_mps=5.0)
+        return g
+
+    def test_distance_uses_real_length_not_chord(self):
+        """邊內距離應採真實 length（400m），而非直線弦（約 200m），避免低估。"""
+        g = self._curved_graph()
+        snap = snap_to_edge(g, 25.0011, 121.0010)  # 點在曲線頂附近
+        start = ((25.0, 121.0), 0)
+        stops = [((25.0011, 121.0010), snap["approach"], snap["enter_node"],
+                  snap["exit_node"], snap["edge_key"], snap["t"])]
+        geo = build_visited_route(g, start, stops, speed_mps=5.0)
+        # 起點即節點 0，主路線只有邊內段；距離應為真實 length 400m
+        assert geo["road_distance_m"] == pytest.approx(400.0, abs=1e-6)
+
+    def test_polyline_follows_curve_and_keeps_approach(self):
+        """polyline 應沿曲線描出中間頂點（含頂點 25.001,121.001），
+        且 approach 點原樣保留、arrival_index 指向它（included 為真）。"""
+        g = self._curved_graph()
+        snap = snap_to_edge(g, 25.0011, 121.0010)
+        start = ((25.0, 121.0), 0)
+        approach = snap["approach"]
+        stops = [((25.0011, 121.0010), approach, snap["enter_node"],
+                  snap["exit_node"], snap["edge_key"], snap["t"])]
+        geo = build_visited_route(g, start, stops, speed_mps=5.0)
+        # 曲線頂點存在 → 確實沿彎道而非直線弦
+        has_apex = any(abs(p[0] - 25.0010) < 1e-6 and abs(p[1] - 121.0010) < 1e-6
+                       for p in geo["polyline"])
+        assert has_apex, "polyline 應包含曲線頂點，代表沿真實彎道描繪"
+        assert geo["included"] == [True]
+        idx = geo["arrival_indices"][0]
+        assert geo["polyline"][idx] == approach
+
+    def test_straight_edge_uses_real_length(self, toy_graph):
+        """直線 toy 邊（length=50、無 geometry）：邊內段距離採真實 length。"""
+        snap = snap_to_edge(toy_graph, toy_graph.nodes[0]["y"],
+                            (toy_graph.nodes[0]["x"] + toy_graph.nodes[1]["x"]) / 2)
+        # 確保 snap 到 0↔1 邊
+        assert {snap["enter_node"], snap["exit_node"]} == {0, 1}
+        start = ((toy_graph.nodes[0]["y"], toy_graph.nodes[0]["x"]),
+                 snap["enter_node"])
+        stops = [((toy_graph.nodes[0]["y"], toy_graph.nodes[0]["x"]),
+                  snap["approach"], snap["enter_node"], snap["exit_node"],
+                  snap["edge_key"], snap["t"])]
+        geo = build_visited_route(toy_graph, start, stops, speed_mps=5.0)
+        # prev_node==enter_u（同節點，主路徑 0m）→ 邊內段應為真實 length 50m
+        assert geo["road_distance_m"] == pytest.approx(50.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 13. 單行邊上的邊內步進：真正不逆向（FIX 4）
+# ---------------------------------------------------------------------------
+class TestInEdgeNoReverse:
+    def test_in_edge_step_is_forward_on_one_way(self):
+        """停靠點 snap 到單行邊（無反向邊）時，邊內 u→approach→v 的描點
+        在該邊上的投影參數 t 必須單調不減（沿合法方向），不會出現需要
+        反向邊才能解釋的移動。"""
+        g = nx.MultiDiGraph()
+        coords = {0: (25.00, 121.00), 1: (25.00, 121.01),
+                  2: (24.99, 121.01), 3: (24.99, 121.00)}
+        for n, (la, lo) in coords.items():
+            g.add_node(n, y=la, x=lo)
+        # 單行環道：僅順向邊，無任何反向邊
+        for a, b in [(0, 1), (1, 2), (2, 3), (3, 0)]:
+            g.add_edge(a, b, length=100.0)
+        make_distance_matrix(g, speed_mps=5.0)
+
+        # 點選在單行邊 1→2 中段附近，snap 後 enter=1, exit=2
+        snap = snap_to_edge(g, 24.995, 121.0105)
+        assert (snap["enter_node"], snap["exit_node"]) == (1, 2)
+        assert not g.has_edge(2, 1), "測試前提：1↔2 之間無反向邊"
+
+        start = ((25.0, 121.0), 0)
+        stops = [((24.995, 121.0105), snap["approach"], snap["enter_node"],
+                  snap["exit_node"], snap["edge_key"], snap["t"])]
+        geo = build_visited_route(g, start, stops, speed_mps=5.0)
+        assert geo["included"] == [True]
+
+        u = g.nodes[1]
+        v = g.nodes[2]
+        # 取出 polyline 中落在 u→v 邊上的點，檢查投影參數 t 單調不減（u→v 方向）
+        u_idx = geo["polyline"].index((u["y"], u["x"]))
+        seg = geo["polyline"][u_idx:]
+        ts = []
+        for p in seg:
+            _, _, t = _project_to_segment(p[0], p[1], u["y"], u["x"], v["y"], v["x"])
+            ts.append(t)
+        for a, b in zip(ts, ts[1:]):
+            assert b >= a - 1e-9, (
+                f"邊內描點在 u→v 上的參數應單調不減（不逆向），實際 {ts}"
+            )
+        # approach 的投影參數應落在 (0,1) 之間（確實在邊內、非端點）
+        assert 0.0 < snap["t"] < 1.0
+
+    def test_relative_order_of_approach_between_endpoints(self):
+        """approach 在 polyline 中應出現在 u 之後、v 之前（合法行進次序）。"""
+        g = nx.MultiDiGraph()
+        coords = {0: (25.00, 121.00), 1: (25.00, 121.01),
+                  2: (24.99, 121.01), 3: (24.99, 121.00)}
+        for n, (la, lo) in coords.items():
+            g.add_node(n, y=la, x=lo)
+        for a, b in [(0, 1), (1, 2), (2, 3), (3, 0)]:
+            g.add_edge(a, b, length=100.0)
+        make_distance_matrix(g, speed_mps=5.0)
+        snap = snap_to_edge(g, 24.995, 121.0105)
+        start = ((25.0, 121.0), 0)
+        approach = snap["approach"]
+        stops = [((24.995, 121.0105), approach, snap["enter_node"],
+                  snap["exit_node"], snap["edge_key"], snap["t"])]
+        geo = build_visited_route(g, start, stops, speed_mps=5.0)
+        pl = geo["polyline"]
+        u_idx = pl.index((g.nodes[1]["y"], g.nodes[1]["x"]))
+        v_idx = pl.index((g.nodes[2]["y"], g.nodes[2]["x"]))
+        a_idx = geo["arrival_indices"][0]
+        assert u_idx < a_idx < v_idx, "approach 應介於 u 與 v 之間"
+
+
+# ---------------------------------------------------------------------------
+# 14. 彈性（非編號）停靠順序：成本最優不等於嚴格編號（FIX 4）
+# ---------------------------------------------------------------------------
+class TestFlexibleOrder:
+    def _grid(self):
+        g = nx.MultiDiGraph()
+        base_lat, base_lon = 25.0625, 121.5290
+        for i in range(5):
+            for j in range(5):
+                n = i * 5 + j
+                g.add_node(n, y=base_lat + i * 0.0005, x=base_lon + j * 0.0005)
+        for i in range(5):
+            for j in range(5):
+                n = i * 5 + j
+                if j < 4:
+                    g.add_edge(n, n + 1, length=50.0)
+                    g.add_edge(n + 1, n, length=50.0)
+                if i < 4:
+                    g.add_edge(n, n + 5, length=50.0)
+                    g.add_edge(n + 5, n, length=50.0)
+        return g
+
+    def test_visited_order_not_strict_numbering(self):
+        """把訂單 3 的取餐點放在最接近起點處，成本最優的停靠順序對至少一個
+        演算法而言不應等於嚴格編號 1p,1d,2p,2d,3p,3d；同時 precedence 仍須成立。"""
+        g = self._grid()
+        dist = make_distance_matrix(g, speed_mps=5.0)
+
+        def off(ns, dlat, dlng):
+            return [(g.nodes[n]["y"] + dlat, g.nodes[n]["x"] + dlng) for n in ns]
+
+        # 起點為節點 0；訂單 3 取餐放在節點 1（最近），訂單 1 取餐放在最遠的節點 24
+        pickups = off([24, 12, 1], 0.00008, 0.00008)
+        dropoffs = off([23, 13, 2], -0.00008, -0.00008)
+        start = (g.nodes[0]["y"], g.nodes[0]["x"])
+        results = compare_algorithms(g, dist, pickups, dropoffs, start=start,
+                                     speed_mps=5.0)
+
+        strict = [(1, "pickup"), (1, "dropoff"), (2, "pickup"),
+                  (2, "dropoff"), (3, "pickup"), (3, "dropoff")]
+        differs_count = 0
+        for r in results:
+            assert r.success, f"{r.name}: {r.error}"
+            seq = [(vs["order_id"], vs["stop_type"]) for vs in r.visited_stops]
+            # precedence：每張單取餐必在送餐之前
+            for oid in (1, 2, 3):
+                assert seq.index((oid, "pickup")) < seq.index((oid, "dropoff"))
+            if seq != strict:
+                differs_count += 1
+        assert differs_count >= 1, (
+            "至少一個演算法的最優停靠順序應不同於嚴格編號順序"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 15. included=False 失敗分支與中文錯誤訊息（FIX 4）
+# ---------------------------------------------------------------------------
+class TestIncludedFailureBranch:
+    def test_unreached_message_pure_helper(self):
+        """純函式 _unreached_stops_message：只列出 included_in_polyline=False 的停靠點，
+        並以規格指定的中文前綴開頭。正常輸入下 approach 必為 polyline 中的點，故此
+        失敗分支以純函式單元測試（非透過會自動補上 approach 的 build_visited_route）。"""
+        visited = [
+            {"order_id": 1, "kind_zh": "取餐", "included_in_polyline": True},
+            {"order_id": 2, "kind_zh": "送餐", "included_in_polyline": False},
+            {"order_id": 3, "kind_zh": "取餐", "included_in_polyline": False},
+        ]
+        msg = _unreached_stops_message(visited)
+        assert msg.startswith("下列取餐/送餐點未被路線確實抵達：")
+        # 僅列出未抵達者（2 送餐、3 取餐），不含已抵達的訂單 1
+        assert "訂單 2 的送餐點" in msg
+        assert "訂單 3 的取餐點" in msg
+        assert "訂單 1" not in msg
+
+    def test_compare_algorithms_emits_chinese_failure_message(self, monkeypatch):
+        """當某停靠點的 approach 未被路線抵達時，compare_algorithms 應標記失敗
+        並產生中文錯誤訊息「下列取餐/送餐點未被路線確實抵達」。
+
+        透過 monkeypatch 讓 build_visited_route 回傳 included 含 False 來觸發此分支
+        （正常輸入下 approach 必為 polyline 中的點，故此分支需注入式觸發）。"""
+        import delivery.interactive as interactive_mod
+
+        toy = nx.MultiDiGraph()
+        base_lat, base_lon = 25.0625, 121.5290
+        for j in range(3):
+            toy.add_node(j, y=base_lat, x=base_lon + j * 0.0005)
+        for j in range(2):
+            toy.add_edge(j, j + 1, length=50.0)
+            toy.add_edge(j + 1, j, length=50.0)
+        dist = make_distance_matrix(toy, speed_mps=5.0)
+
+        real_build = interactive_mod.build_visited_route
+
+        def fake_build(graph, start, stops, **kwargs):
+            geo = real_build(graph, start, stops, **kwargs)
+            # 故意把第一個停靠點標記為未抵達
+            geo = dict(geo)
+            geo["included"] = [False] + list(geo["included"])[1:]
+            return geo
+
+        monkeypatch.setattr(interactive_mod, "build_visited_route", fake_build)
+
+        pickups = [(base_lat, base_lon)]
+        dropoffs = [(base_lat, base_lon + 0.0010)]
+        results = compare_algorithms(toy, dist, pickups, dropoffs, speed_mps=5.0)
+        failed = [r for r in results if not r.success]
+        assert failed, "注入 included=False 後應至少一個演算法失敗"
+        for r in failed:
+            assert r.all_stops_visited is False
+            assert r.error is not None
+            assert "下列取餐/送餐點未被路線確實抵達" in r.error

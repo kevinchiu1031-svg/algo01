@@ -37,28 +37,39 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-# ── Graph 載入（module-level；供測試端直接 import 此 module） ─────────────────
+# ── Graph 懶載入（lazy loading；import 此 module 不觸發網路下載） ───────────
+_GRAPH = None
+_DIST = None
+_CENTER_LAT = None
+_CENTER_LNG = None
+
+
 def _load(place: str = "Taipei Main Station, Taipei, Taiwan",
           dist_meters: int = 2500,
           speed_mps: float = 5.0):
     print(f"[INFO] 載入路網圖：{place}（半徑 {dist_meters} m）…")
-    graph = load_graph(place=place, dist_meters=dist_meters)
-    print(f"[INFO] 節點數={graph.number_of_nodes()}  邊數={graph.number_of_edges()}")
-    dist = make_distance_matrix(graph, speed_mps=speed_mps)
-    return graph, dist
+    g = load_graph(place=place, dist_meters=dist_meters)
+    print(f"[INFO] 節點數={g.number_of_nodes()}  邊數={g.number_of_edges()}")
+    d = make_distance_matrix(g, speed_mps=speed_mps)
+    return g, d
 
 
-# 在直接執行時從命令列取參數；被 import 時使用預設值（載入同一份快取）
+def get_graph_dist(place: str = "Taipei Main Station, Taipei, Taiwan",
+                   dist_meters: int = 2500,
+                   speed_mps: float = 5.0):
+    """首次呼叫時載入路網圖並快取；後續呼叫直接回傳快取。"""
+    global _GRAPH, _DIST, _CENTER_LAT, _CENTER_LNG
+    if _GRAPH is None:
+        _GRAPH, _DIST = _load(place, dist_meters, speed_mps)
+        _nodes = list(_GRAPH.nodes(data=True))
+        _CENTER_LAT = sum(d["y"] for _, d in _nodes) / len(_nodes)
+        _CENTER_LNG = sum(d["x"] for _, d in _nodes) / len(_nodes)
+    return _GRAPH, _DIST
+
+
+# 在直接執行時從命令列取參數，伺服器啟動前預先暖機
 if __name__ == "__main__":
     _cli_args = parse_args()
-    graph, dist = _load(_cli_args.place, _cli_args.dist_meters, _cli_args.speed)
-else:
-    graph, dist = _load()
-
-# ── 計算地圖中心 ─────────────────────────────────────────────────────────────
-_nodes = list(graph.nodes(data=True))
-_center_lat = sum(d["y"] for _, d in _nodes) / len(_nodes)
-_center_lng = sum(d["x"] for _, d in _nodes) / len(_nodes)
 
 # ── Flask app ────────────────────────────────────────────────────────────────
 app = Flask(
@@ -75,23 +86,55 @@ app.json.ensure_ascii = False
 
 @app.route("/")
 def index():
+    _graph, _ = get_graph_dist()
+    center_lat = _CENTER_LAT
+    center_lng = _CENTER_LNG
     return render_template(
         "interactive_map.html",
-        center_lat=_center_lat,
-        center_lng=_center_lng,
+        center_lat=center_lat,
+        center_lng=center_lng,
         zoom=16,
     )
+
+
+def _is_pair(pt) -> bool:
+    """回傳 True 若 pt 是包含兩個數字的 list/tuple。"""
+    try:
+        return (hasattr(pt, "__len__") and len(pt) == 2
+                and all(isinstance(v, (int, float)) for v in pt))
+    except Exception:
+        return False
 
 
 @app.route("/api/route", methods=["POST"])
 def api_route():
     body = request.get_json(force=True, silent=True) or {}
 
+    # ── 輸入驗證（400 Bad Request） ──────────────────────────────────────────
+    start_raw = body.get("start", None)
+    if start_raw is not None and not _is_pair(start_raw):
+        return jsonify({"ok": False,
+                        "error": "start 格式錯誤：須為 [緯度, 經度] 數字陣列"}), 400
+
+    speed_raw = body.get("speed_mps", 5.0)
+    if not isinstance(speed_raw, (int, float)):
+        return jsonify({"ok": False,
+                        "error": "speed_mps 格式錯誤：須為數字"}), 400
+
+    pickups_raw  = body.get("pickups", [])
+    dropoffs_raw = body.get("dropoffs", [])
+    if not isinstance(pickups_raw, list) or not all(_is_pair(p) for p in pickups_raw):
+        return jsonify({"ok": False,
+                        "error": "pickups 格式錯誤：須為 [[緯度, 經度], ...] 陣列"}), 400
+    if not isinstance(dropoffs_raw, list) or not all(_is_pair(p) for p in dropoffs_raw):
+        return jsonify({"ok": False,
+                        "error": "dropoffs 格式錯誤：須為 [[緯度, 經度], ...] 陣列"}), 400
+
     try:
-        pickups_raw  = body.get("pickups", [])
-        dropoffs_raw = body.get("dropoffs", [])
-        start_raw    = body.get("start", None)
-        speed_mps    = float(body.get("speed_mps", 5.0))
+        speed_mps = float(speed_raw)
+
+        # 取得（懶載入）路網圖
+        graph, dist = get_graph_dist()
 
         # 轉成 tuple
         pickups  = [tuple(pt) for pt in pickups_raw]
@@ -124,6 +167,8 @@ def api_route():
 
 # ── 入口 ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # 伺服器啟動前預先暖機（eager pre-load），避免首個請求等待
+    get_graph_dist(_cli_args.place, _cli_args.dist_meters, _cli_args.speed)
     url = f"http://{_cli_args.host}:{_cli_args.port}/"
     print(f"[INFO] 伺服器啟動：{url}")
     app.run(host=_cli_args.host, port=_cli_args.port, debug=False)

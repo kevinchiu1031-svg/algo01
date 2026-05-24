@@ -3,7 +3,6 @@
 Snap 到路網節點，以三種演算法規劃路線並回傳結果。"""
 from __future__ import annotations
 
-import json
 import math
 import time
 from dataclasses import dataclass, field
@@ -137,14 +136,14 @@ def snap_to_edge(graph: nx.MultiDiGraph, lat: float, lng: float) -> dict:
     抵達停靠點是沿合法行駛方向經過該道路側，而非橫跨對向車道。
     若圖中沒有邊，退回最近節點（enter==exit）。
     """
-    best: tuple | None = None  # (perp_m, u, v, k, plat, plng)
+    best: tuple | None = None  # (perp_m, u, v, k, plat, plng, t)
     for u, v, k, data in graph.edges(keys=True, data=True):
         au, av = graph.nodes[u], graph.nodes[v]
-        plat, plng, _t = _project_to_segment(
+        plat, plng, t = _project_to_segment(
             lat, lng, au["y"], au["x"], av["y"], av["x"]
         )
         perp = _haversine_m(lat, lng, plat, plng)
-        cand = (perp, u, v, k, plat, plng)
+        cand = (perp, u, v, k, plat, plng, t)
         if best is None or cand[:4] < best[:4]:  # 以 (perp,u,v,k) 做穩定排序
             best = cand
     if best is None:
@@ -154,12 +153,14 @@ def snap_to_edge(graph: nx.MultiDiGraph, lat: float, lng: float) -> dict:
             "approach": (nd["y"], nd["x"]),
             "enter_node": n, "exit_node": n,
             "perp_m": _haversine_m(lat, lng, nd["y"], nd["x"]),
+            "edge_key": None, "t": 0.0,
         }
-    perp, u, v, _k, plat, plng = best
+    perp, u, v, k, plat, plng, t = best
     return {
         "approach": (plat, plng),
         "enter_node": u, "exit_node": v,
         "perp_m": perp,
+        "edge_key": k, "t": t,
     }
 
 
@@ -255,17 +256,81 @@ def route_geometry(
     return polyline, total_distance_m, total_time_s
 
 
+def _edge_curve_points(
+    data: dict, u_coord: tuple[float, float], v_coord: tuple[float, float]
+) -> list[tuple[float, float]] | None:
+    """若邊帶有 shapely LineString geometry，回傳沿道路曲線（含兩端）的 (lat,lng) 序列。
+
+    OSMnx geometry 的座標為 (lng, lat) 對。方向可能與 u→v 相反，故依端點對齊：
+    若曲線第一點較接近 v_coord 則反轉，確保輸出由 u_coord 往 v_coord。
+    無 geometry 時回傳 None（呼叫端退回直線弦）。
+    """
+    geom = data.get("geometry")
+    coords = getattr(geom, "coords", None)
+    if coords is None:
+        return None
+    pts = [(lat, lng) for (lng, lat) in coords]  # shapely 為 (x=lng, y=lat)
+    if len(pts) < 2:
+        return None
+    # 對齊方向：geometry 端點未必與 u→v 同序
+    d_first = _haversine_m(*pts[0], *u_coord)
+    d_last = _haversine_m(*pts[-1], *u_coord)
+    if d_last < d_first:
+        pts = list(reversed(pts))
+    return pts
+
+
+def _approach_split_index(
+    curve: list[tuple[float, float]], approach: tuple[float, float]
+) -> int:
+    """在曲線頂點序列中找到 approach 的插入位置（split index）。
+
+    回傳 idx，使曲線頂點 curve[1:idx] 屬「u→approach」段（在 approach 之前），
+    curve[idx:-1] 屬「approach→v」段。以「投影參數最接近 approach 的線段」決定切點：
+    找出 approach 投影落點所在的線段，其後一個頂點即為 split index。
+    """
+    best_idx = len(curve) - 1
+    best_d = float("inf")
+    for i in range(len(curve) - 1):
+        a, b = curve[i], curve[i + 1]
+        plat, plng, _t = _project_to_segment(
+            approach[0], approach[1], a[0], a[1], b[0], b[1]
+        )
+        d = _haversine_m(approach[0], approach[1], plat, plng)
+        if d < best_d:
+            best_d = d
+            best_idx = i + 1  # approach 落在 curve[i]~curve[i+1]，分界在 i+1
+    return best_idx
+
+
+def _add_curve_before_approach(add_point, curve, approach) -> None:
+    """加入 u→approach 段的曲線中間頂點（不含端點 u 與 approach 本身）。"""
+    idx = _approach_split_index(curve, approach)
+    for c in curve[1:idx]:
+        add_point(c)
+
+
+def _add_curve_after_approach(add_point, curve, approach) -> None:
+    """加入 approach→v 段的曲線中間頂點（不含 approach 與端點 v）。"""
+    idx = _approach_split_index(curve, approach)
+    for c in curve[idx:-1]:
+        add_point(c)
+
+
 def build_visited_route(
     graph: nx.MultiDiGraph,
     start: tuple[tuple[float, float], int],
-    stops: list[tuple[tuple[float, float], tuple[float, float], int, int]],
+    stops: list[tuple],
     speed_mps: float = 5.0,
     walk_speed_mps: float = WALK_SPEED_MPS,
 ) -> dict:
     """建立「單一條連續、靠右不逆向」且確實抵達每個停靠點的路線。
 
     start：(起點 lat/lng, 起點道路節點)。
-    每個 stop：(原始門口 lat/lng, 可抵達馬路位置 approach lat/lng, 進入節點 u, 離開節點 v)。
+    每個 stop：(原始門口 lat/lng, 可抵達馬路位置 approach lat/lng, 進入節點 u, 離開節點 v,
+                [edge_key], [t])。其中 edge_key 為 snap 選定的平行邊鍵；t∈[0,1] 為
+                approach 在 u→v 邊上的投影參數（u 端 t=0、v 端 t=1）。後兩者為選填，
+                未提供時退回以直線弦估算距離與幾何（保持 toy-graph 既有行為不變）。
 
     路線結構（每個停靠點）：
         ...上一站離開節點 → [有向道路 shortest path] → 進入節點 u
@@ -274,6 +339,9 @@ def build_visited_route(
     - 主路線：全程沿 directed graph 的 shortest path，遵守道路方向；需要折返時會
       自然繞經可轉向路口，不會在路段中逆向或瞬移迴轉。polyline 為單一 ordered 序列，
       可重複經過同一路段，但不分裂成多條分支。
+    - 邊內段（u→approach→v）：距離以該邊真實 length 依 t 切分（length*t 與 length*(1-t)），
+      幾何則沿該邊的 shapely geometry 曲線描繪（無 geometry 時退回直線）；approach 點
+      必定原樣出現在 polyline 中，確保 arrival_index/included 正確。
     - 接駁段：approach（馬路位置）→ 門口原始座標，屬「靠邊停車後步行/牽車」的最後幾公尺，
       不計入主路線道路距離，另計為 approach_distance（以步行速度估時）。
 
@@ -295,11 +363,15 @@ def build_visited_route(
                 or abs(polyline[-1][1] - pt[1]) > eps):
             polyline.append(pt)
 
-    start_orig, start_node = start
+    start_node = start[1]
     add_point((graph.nodes[start_node]["y"], graph.nodes[start_node]["x"]))
 
     prev_node = start_node
-    for orig, approach, enter_u, exit_v in stops:
+    for stop in stops:
+        # stop 可能為 4-tuple（舊式）或 6-tuple（含 edge_key, t）
+        orig, approach, enter_u, exit_v = stop[0], stop[1], stop[2], stop[3]
+        edge_key = stop[4] if len(stop) > 4 else None
+        t_param = stop[5] if len(stop) > 5 else None
         # 1) 由上一站沿有向道路抵達進入節點 u
         coords, d, t = _road_path(graph, prev_node, enter_u, speed_mps)
         road_d += d
@@ -309,20 +381,50 @@ def build_visited_route(
         # 2) 沿該道路邊 u→approach→v 行駛（合法方向），approach 為實際抵達的馬路位置
         u_coord = (graph.nodes[enter_u]["y"], graph.nodes[enter_u]["x"])
         v_coord = (graph.nodes[exit_v]["y"], graph.nodes[exit_v]["x"])
-        seg = (_haversine_m(*u_coord, *approach) + _haversine_m(*approach, *v_coord))
+
+        # 取該邊資料（優先用 snap 記錄的 edge_key；否則取 length 最小的平行邊）
+        edata: dict | None = None
+        if enter_u != exit_v and graph.has_edge(enter_u, exit_v):
+            edges = graph[enter_u][exit_v]
+            if edge_key is not None and edge_key in edges:
+                edata = edges[edge_key]
+            else:
+                edata = min(edges.values(),
+                            key=lambda e: e.get("length", float("inf")))
+
+        edge_len = edata.get("length") if edata is not None else None
+
+        # 2a) 距離：以真實 length 依 t 切分；length 缺失時退回直線弦
+        if edge_len is not None and t_param is not None:
+            seg = edge_len  # length*t + length*(1-t) == length
+        else:
+            seg = _haversine_m(*u_coord, *approach) + _haversine_m(*approach, *v_coord)
         road_d += seg
         road_t += seg / speed_mps if speed_mps > 0 else 0.0
-        add_point(approach)
-        arrival_indices.append(len(polyline) - 1)   # approach 點在 polyline 的索引
-        if (exit_v != enter_u):
-            add_point(v_coord)
+
+        # 2b) 幾何：沿邊曲線描點（u→approach、approach→v）；無 geometry 時退回直線
+        curve = _edge_curve_points(edata, u_coord, v_coord) if edata is not None else None
+        if curve is not None:
+            # 將 approach 之前的曲線頂點加入（u→approach 段），再放入 approach 本身
+            _add_curve_before_approach(add_point, curve, approach)
+            add_point(approach)
+            arrival_indices.append(len(polyline) - 1)
+            if exit_v != enter_u:
+                _add_curve_after_approach(add_point, curve, approach)
+                add_point(v_coord)
+        else:
+            add_point(approach)
+            arrival_indices.append(len(polyline) - 1)   # approach 點在 polyline 的索引
+            if exit_v != enter_u:
+                add_point(v_coord)
         # 3) 門口接駁段（馬路位置→原始門口）：不計入主路線，另計 approach 距離/時間
         approach_d += _haversine_m(*approach, orig[0], orig[1])
         prev_node = exit_v
 
     # 驗證每個停靠點的 approach（可抵達馬路位置）確實出現在 polyline 中
     included: list[bool] = []
-    for _orig, approach, _u, _v in stops:
+    for stop in stops:
+        approach = stop[1]
         hit = any(
             abs(p[0] - approach[0]) <= 1e-7 and abs(p[1] - approach[1]) <= 1e-7
             for p in polyline
@@ -344,6 +446,18 @@ def build_visited_route(
 # ---------------------------------------------------------------------------
 # 主要比較函式
 # ---------------------------------------------------------------------------
+def _unreached_stops_message(visited_stops: list[dict]) -> str:
+    """由 visited_stops 中 included_in_polyline 為 False 的項目，組出中文失敗訊息。
+
+    純函式（無副作用），方便單元測試 included=False 失敗分支的訊息內容。
+    """
+    missing = "、".join(
+        f"訂單 {vs['order_id']} 的{vs['kind_zh']}點"
+        for vs in visited_stops if not vs["included_in_polyline"]
+    )
+    return "下列取餐/送餐點未被路線確實抵達：" + missing
+
+
 def compare_algorithms(
     graph: nx.MultiDiGraph,
     dist: DistanceMatrix,
@@ -383,11 +497,16 @@ def compare_algorithms(
         stop_meta[(oid, "pickup")] = {
             "orig": (pu_latlng[0], pu_latlng[1]), "approach": sp["approach"],
             "enter": sp["enter_node"], "exit": sp["exit_node"],
+            "edge_key": sp.get("edge_key"), "t": sp.get("t", 0.0),
         }
         stop_meta[(oid, "dropoff")] = {
             "orig": (do_latlng[0], do_latlng[1]), "approach": sd["approach"],
             "enter": sd["enter_node"], "exit": sd["exit_node"],
+            "edge_key": sd.get("edge_key"), "t": sd.get("t", 0.0),
         }
+        # 已知建模簡化：dispatcher 以 enter_node 的有向最短距離排序停靠點，
+        # 但實際繪製的路線還包含「邊內 u→approach→v」接近段；因此演算法最佳化的
+        # 成本只是所顯示 road_distance_m 的近似值（兩者排序通常一致，量值略有差距）。
         orders.append(Order(
             id=oid,
             restaurant_node=sp["enter_node"],   # 演算法以 snap 後道路節點排序/計距（核心不變）
@@ -426,7 +545,11 @@ def compare_algorithms(
             compute_ms = (time.perf_counter() - t0) * 1000.0
 
             metas = [stop_meta[(s.order_id, s.kind)] for s in route]
-            stop_wps = [(m["orig"], m["approach"], m["enter"], m["exit"]) for m in metas]
+            stop_wps = [
+                (m["orig"], m["approach"], m["enter"], m["exit"],
+                 m["edge_key"], m["t"])
+                for m in metas
+            ]
             geo = build_visited_route(graph, start_wp, stop_wps, speed_mps=speed_mps)
 
             included = geo["included"]
@@ -452,17 +575,13 @@ def compare_algorithms(
             total_time = geo["road_time_s"] + geo["approach_time_s"]
 
             if not all(included):
-                missing = "、".join(
-                    f"訂單 {vs['order_id']} 的{vs['kind_zh']}點"
-                    for vs in visited_stops if not vs["included_in_polyline"]
-                )
                 results.append(AlgoResult(
                     name=algo_name, display_name=display_name, success=False,
                     total_distance_m=road_d + appr_d, road_distance_m=road_d,
                     approach_distance_m=appr_d, total_time_s=total_time,
                     compute_ms=compute_ms, polyline=geo["polyline"], num_stops=len(route),
                     visited_stops=visited_stops, all_stops_visited=False,
-                    error="下列取餐/送餐點未被路線確實抵達：" + missing,
+                    error=_unreached_stops_message(visited_stops),
                 ))
                 continue
 

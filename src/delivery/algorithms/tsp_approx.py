@@ -61,6 +61,13 @@ def _mst_preorder(
     # 從 parent 陣列建鄰接表
     children: list[list[int]] = [[] for _ in range(n)]
     for v in range(1, n):
+        # 防禦性檢查：parent[v] 仍為 -1 表示 v 與 MST 不連通（非強連通圖、距離為 inf）。
+        # 在真實 SCC 圖上不會發生；若發生，明確報錯，避免 children[-1] 默默吞掉該停靠點。
+        if parent[v] == -1:
+            raise ValueError(
+                f"MST 無法連接停靠點 index {v}（node={nodes[v]}）："
+                f"圖可能非強連通，存在無限距離。"
+            )
         children[parent[v]].append(v)
 
     # DFS preorder from root (index 0)
