@@ -163,56 +163,60 @@ async function computeRoute() {
   renderResults(data);
 }
 
+// 由 visited_stops 組出「停靠順序」字串，例如「取3 → 送3 → 取1 → ...」
+function stopOrderStr(visited) {
+  return (visited || [])
+    .map(v => `${v.kind_zh}${v.order_id}`)
+    .join(" → ");
+}
+
 // ─── 渲染結果 ────────────────────────────────────────────────────────────────
 function renderResults(data) {
   clearRoutes();
 
-  const { results, analysis, snapped } = data;
+  const { results, analysis } = data;
 
-  // 繪製路線
+  // 繪製每個演算法的「單一連續路線」（沿有向道路、經過各 approach 馬路位置）
   const bounds = [];
   results.forEach((r, i) => {
     if (!r.success || !r.polyline || r.polyline.length === 0) return;
-    const color = ALGO_COLORS[i];
     const poly = L.polyline(r.polyline, {
-      color,
+      color: ALGO_COLORS[i],
       weight: 4,
       opacity: 0.85,
     }).addTo(map);
     routePolylines.push(poly);
     r.polyline.forEach(pt => bounds.push(pt));
   });
-
-  // Fit bounds
   if (bounds.length > 0) {
     map.fitBounds(L.latLngBounds(bounds), { padding: [30, 30] });
   }
 
-  // 繪製 snapped 標記（小圓點）
-  const drawSnap = (latlng, color, title) => {
-    const m = L.circleMarker(latlng, {
-      radius: 6,
-      color: "#fff",
-      weight: 2,
-      fillColor: color,
-      fillOpacity: 1,
-    }).bindTooltip(title, { direction: "top", permanent: false }).addTo(map);
+  // approach 馬路位置 + 接駁虛線（approach 三演算法相同，取第一個成功結果繪製一次）
+  const base = results.find(r => r.success) || results[0];
+  (base.visited_stops || []).forEach(vs => {
+    const isPickup = vs.stop_type === "pickup";
+    const color = isPickup ? "#e67e22" : "#2980b9";
+    // approach：實際可合法抵達的馬路位置（小方點）
+    const m = L.circleMarker(vs.approach_latlng, {
+      radius: 5, color: "#fff", weight: 2, fillColor: color, fillOpacity: 1,
+    }).bindTooltip(`${vs.kind_zh}#${vs.order_id}（可抵達馬路位置）`, { direction: "top" }).addTo(map);
     snappedMarkers.push(m);
-  };
-
-  (snapped.pickups  || []).forEach((pt, i) => drawSnap(pt, "#e67e22", `取餐點 #${i+1} (Snap)`));
-  (snapped.dropoffs || []).forEach((pt, i) => drawSnap(pt, "#2980b9", `送餐點 #${i+1} (Snap)`));
-  if (snapped.start) drawSnap(snapped.start, "#2c3e50", "司機起點 (Snap)");
+    // 接駁虛線：馬路位置 → 門口原始點（最後幾公尺步行/牽車，非機車道路）
+    const dash = L.polyline([vs.approach_latlng, vs.original_latlng], {
+      color, weight: 2, opacity: 0.7, dashArray: "4 5",
+    }).addTo(map);
+    snappedMarkers.push(dash);
+  });
 
   // ── 建立 HTML ────────────────────────────────────────────────────────────
   let html = `<h2>演算法比較</h2>`;
 
-  // 取/送餐點是否皆已被路線經過
   const allVisited = results.every(r => r.all_stops_visited);
   html += `<p style="font-size:0.85rem;font-weight:bold;padding:6px 8px;border-radius:4px;margin-bottom:10px;`
         + (allVisited
-            ? `background:#e8f8ef;color:#1e7e44;">✓ 所有取餐／送餐點皆已被路線經過`
-            : `background:#fde8e8;color:#c0392b;">⚠ 有取餐／送餐點未被路線包含，詳見下表「結果說明」`)
+            ? `background:#e8f8ef;color:#1e7e44;">✓ 所有取餐／送餐點皆已抵達（最近可合法停靠的馬路位置）`
+            : `background:#fde8e8;color:#c0392b;">⚠ 有取餐／送餐點未能抵達，詳見下表「是否皆抵達」`)
         + `</p>`;
 
   // 路線圖例
@@ -233,33 +237,50 @@ function renderResults(data) {
       <thead>
         <tr>
           <th>演算法</th>
+          <th>停靠順序</th>
+          <th>主路線距離</th>
+          <th>停靠接近距離</th>
           <th>總距離</th>
-          <th>預估行駛時間</th>
+          <th>預估時間</th>
           <th>計算時間</th>
-          <th>結果說明</th>
+          <th>是否皆抵達</th>
         </tr>
       </thead>
       <tbody>`;
 
   results.forEach((r, i) => {
-    const distStr = r.success ? fmtDist(r.total_distance_m) : "—";
-    const timeStr = r.success ? fmtTime(r.total_time_s)     : "—";
+    const dash = "—";
+    const orderStr = r.success ? stopOrderStr(r.visited_stops)
+                               : `失敗：${r.error || ""}`;
+    const roadStr = r.success ? fmtDist(r.road_distance_m) : dash;
+    const apprStr = r.success ? `${Math.round(r.approach_distance_m)} 公尺` : dash;
+    const totalStr = r.success ? fmtDist(r.total_distance_m) : dash;
+    const timeStr = r.success ? fmtTime(r.total_time_s) : dash;
     const compStr = r.compute_ms.toFixed(2) + " 毫秒";
-    const resultStr = r.success
-      ? `成功（${r.num_stops} 個停靠點，皆已經過）`
-      : `失敗：${r.error || ""}`;
+    const reachStr = r.success
+      ? (r.all_stops_visited ? "✓ 全部抵達" : "✗ 未全抵達")
+      : "✗ 失敗";
     const colorDot = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${ALGO_COLORS[i]};margin-right:5px;"></span>`;
     html += `
       <tr onclick="highlightRoute(${i})" id="algo-row-${i}">
         <td>${colorDot}${r.display_name}</td>
-        <td>${distStr}</td>
+        <td style="font-size:0.74rem;">${orderStr}</td>
+        <td>${roadStr}</td>
+        <td>${apprStr}</td>
+        <td>${totalStr}</td>
         <td>${timeStr}</td>
         <td>${compStr}</td>
-        <td>${resultStr}</td>
+        <td>${reachStr}</td>
       </tr>`;
   });
 
   html += `</tbody></table>`;
+
+  // 標記說明
+  html += `<p style="font-size:0.74rem;color:#888;margin-bottom:10px;">`
+        + `說明：路線沿單行道方向行駛（不逆向），需折返時會繞經路口。`
+        + `實心 marker＝你點選的門口位置；小圓點＝機車可合法停靠的馬路位置；`
+        + `虛線＝靠邊停車後步行/牽車的最後幾公尺（計入「停靠接近距離」，不計入主路線）。</p>`;
 
   // 分析說明
   html += `

@@ -8,12 +8,14 @@ from delivery.models import DistanceMatrix
 
 
 def load_graph(
-    place: str = "Tatung University, Taipei, Taiwan",
-    dist_meters: int = 1500,
+    place: str = "Taipei Main Station, Taipei, Taiwan",
+    dist_meters: int = 2500,
     network_type: str = "drive",
     cache_dir: Path | str = "data/cache",
 ) -> nx.MultiDiGraph:
-    """從 OSMnx 拉路網，只保留最大 strongly-connected component（避免 random 顧客取到孤立節點）。"""
+    """從 OSMnx 拉路網（network_type='drive'，適合機車的行車路網，含單行道方向），
+    只保留最大 strongly-connected component（確保任兩點間在「遵守道路方向」下都可互達，
+    避免逆向才連得到的孤立節點）。預設為台北市中心一帶（台北車站半徑 2500m）。"""
     import osmnx as ox  # 延遲 import，避免單元測試啟動時碰網路套件
 
     cache_dir = Path(cache_dir)

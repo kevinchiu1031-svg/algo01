@@ -22,7 +22,6 @@ from delivery.interactive import (  # noqa: E402
     AlgoResult,
     chinese_analysis,
     compare_algorithms,
-    nearest_node,
 )
 from delivery.map_loader import load_graph, make_distance_matrix  # noqa: E402
 
@@ -32,15 +31,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="外送路由互動式規劃 Flask 伺服器")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=5000)
-    p.add_argument("--place", default="Tatung University, Taipei, Taiwan")
-    p.add_argument("--dist-meters", type=int, default=1500)
+    p.add_argument("--place", default="Taipei Main Station, Taipei, Taiwan")
+    p.add_argument("--dist-meters", type=int, default=2500)
     p.add_argument("--speed", type=float, default=5.0)
     return p.parse_args(argv)
 
 
 # ── Graph 載入（module-level；供測試端直接 import 此 module） ─────────────────
-def _load(place: str = "Tatung University, Taipei, Taiwan",
-          dist_meters: int = 1500,
+def _load(place: str = "Taipei Main Station, Taipei, Taiwan",
+          dist_meters: int = 2500,
           speed_mps: float = 5.0):
     print(f"[INFO] 載入路網圖：{place}（半徑 {dist_meters} m）…")
     graph = load_graph(place=place, dist_meters=dist_meters)
@@ -105,30 +104,12 @@ def api_route():
 
         analysis_text = chinese_analysis(results)
 
-        # ── 計算 snapped 座標 ──────────────────────────────────────────────
-        def snap_coord(lat: float, lng: float) -> list[float]:
-            node = nearest_node(graph, lat, lng)
-            nd = graph.nodes[node]
-            return [nd["y"], nd["x"]]
-
-        snapped_pickups  = [snap_coord(lat, lng) for lat, lng in pickups]
-        snapped_dropoffs = [snap_coord(lat, lng) for lat, lng in dropoffs]
-
-        if start is not None:
-            snapped_start = snap_coord(start[0], start[1])
-        else:
-            # 鏡像後端預設：以第一個取餐節點作為起點
-            snapped_start = snapped_pickups[0]
-
+        # 取/送餐點的「可抵達馬路位置（approach）」與原始門口座標已包含在每個結果的
+        # visited_stops 中（三演算法的 snap 結果相同），前端據此繪製 approach 標記與接駁虛線。
         response_data = {
             "ok": True,
             "results": [r.to_dict() for r in results],
             "analysis": analysis_text,
-            "snapped": {
-                "pickups":  snapped_pickups,
-                "dropoffs": snapped_dropoffs,
-                "start":    snapped_start,
-            },
         }
         resp = jsonify(response_data)
         resp.headers["Content-Type"] = "application/json; charset=utf-8"

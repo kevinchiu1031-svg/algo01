@@ -40,14 +40,16 @@ class AlgoResult:
     name: str                          # "greedy" | "tsp_approx" | "dp"
     display_name: str                  # 中文顯示名稱
     success: bool
-    total_distance_m: float
+    total_distance_m: float            # = 主路線距離 + 停靠接近距離
     total_time_s: float
     compute_ms: float
-    polyline: list[tuple[float, float]]  # 依序 (lat, lng)：沿實際道路 + 接駁到原始點位
+    polyline: list[tuple[float, float]]  # 單一連續折線 (lat, lng)：沿有向道路，經過各停靠點的「可合法抵達馬路位置」
     num_stops: int                     # == 2 * num_orders
-    # 每個停靠點的驗證資訊（取餐/送餐），含原始座標、snap 節點座標、是否已被 polyline 經過
+    road_distance_m: float = 0.0       # 主路線距離（沿有向道路 shortest path）
+    approach_distance_m: float = 0.0   # 停靠接近距離（馬路位置→門口的最後一小段，總和）
+    # 每個停靠點的驗證資訊（取餐/送餐）
     visited_stops: list[dict] = field(default_factory=list)
-    all_stops_visited: bool = True     # 是否所有取/送餐點都被路線經過
+    all_stops_visited: bool = True     # 是否所有取/送餐點都被路線確實抵達
     error: str | None = None
 
     def to_dict(self) -> dict:
@@ -57,6 +59,8 @@ class AlgoResult:
             "display_name": self.display_name,
             "success": self.success,
             "total_distance_m": self.total_distance_m,
+            "road_distance_m": self.road_distance_m,
+            "approach_distance_m": self.approach_distance_m,
             "total_time_s": self.total_time_s,
             "compute_ms": self.compute_ms,
             "polyline": [list(pt) for pt in self.polyline],
@@ -90,6 +94,73 @@ def nearest_node(graph: nx.MultiDiGraph, lat: float, lng: float) -> int:
     if best_node is None:
         raise ValueError("路網圖中沒有節點")
     return best_node
+
+
+# 接駁段（馬路位置→門口）以步行/牽車的低速估算，明確區別於道路行駛速度。
+WALK_SPEED_MPS = 1.2
+
+
+def _project_to_segment(
+    plat: float, plng: float,
+    alat: float, alng: float,
+    blat: float, blng: float,
+) -> tuple[float, float, float]:
+    """把點 P 投影到線段 A-B 上，回傳 (投影點 lat, 投影點 lng, 參數 t∈[0,1])。
+    以 P 緯度的 cos 值修正經度比例，做近似平面投影（< 數公里尺度足夠精確）。
+    """
+    coslat = math.cos(math.radians(plat))
+    ax, ay = alng * coslat, alat
+    bx, by = blng * coslat, blat
+    px, py = plng * coslat, plat
+    dx, dy = bx - ax, by - ay
+    denom = dx * dx + dy * dy
+    if denom == 0.0:
+        t = 0.0
+    else:
+        t = ((px - ax) * dx + (py - ay) * dy) / denom
+        t = max(0.0, min(1.0, t))
+    proj_lat = ay + t * dy
+    proj_lng = (ax + t * dx) / coslat
+    return proj_lat, proj_lng, t
+
+
+def snap_to_edge(graph: nx.MultiDiGraph, lat: float, lng: float) -> dict:
+    """把使用者點選位置 snap 到「最近的可行駛有向道路邊」，而非單一節點。
+
+    回傳 dict：
+      - approach        : (lat, lng) 投影到該道路邊上的點＝機車可合法抵達的馬路位置
+      - enter_node (u)  : 該有向邊上游節點（行駛方向 u→v）
+      - exit_node  (v)  : 該有向邊下游節點
+      - perp_m          : 原始點到該道路邊的垂直距離（公尺）≈ 接駁距離
+
+    機車沿 u→v 方向行駛，途中經過 approach 點，確保「靠右、不逆向」：
+    抵達停靠點是沿合法行駛方向經過該道路側，而非橫跨對向車道。
+    若圖中沒有邊，退回最近節點（enter==exit）。
+    """
+    best: tuple | None = None  # (perp_m, u, v, k, plat, plng)
+    for u, v, k, data in graph.edges(keys=True, data=True):
+        au, av = graph.nodes[u], graph.nodes[v]
+        plat, plng, _t = _project_to_segment(
+            lat, lng, au["y"], au["x"], av["y"], av["x"]
+        )
+        perp = _haversine_m(lat, lng, plat, plng)
+        cand = (perp, u, v, k, plat, plng)
+        if best is None or cand[:4] < best[:4]:  # 以 (perp,u,v,k) 做穩定排序
+            best = cand
+    if best is None:
+        n = nearest_node(graph, lat, lng)
+        nd = graph.nodes[n]
+        return {
+            "approach": (nd["y"], nd["x"]),
+            "enter_node": n, "exit_node": n,
+            "perp_m": _haversine_m(lat, lng, nd["y"], nd["x"]),
+        }
+    perp, u, v, _k, plat, plng = best
+    return {
+        "approach": (plat, plng),
+        "enter_node": u, "exit_node": v,
+        "perp_m": perp,
+    }
 
 
 def plan_full_route(
@@ -187,73 +258,87 @@ def route_geometry(
 def build_visited_route(
     graph: nx.MultiDiGraph,
     start: tuple[tuple[float, float], int],
-    stops: list[tuple[tuple[float, float], int]],
+    stops: list[tuple[tuple[float, float], tuple[float, float], int, int]],
     speed_mps: float = 5.0,
-) -> tuple[list[tuple[float, float]], float, float, list[bool]]:
-    """建立「嚴格經過每個使用者原始點位」的完整路線。
+    walk_speed_mps: float = WALK_SPEED_MPS,
+) -> dict:
+    """建立「單一條連續、靠右不逆向」且確實抵達每個停靠點的路線。
 
-    start 與每個 stop 皆為 (原始經緯度 (lat,lng), snap 後最近道路節點)。
+    start：(起點 lat/lng, 起點道路節點)。
+    每個 stop：(原始門口 lat/lng, 可抵達馬路位置 approach lat/lng, 進入節點 u, 離開節點 v)。
 
-    完整路線結構（確保 polyline 視覺上真正經過使用者點選的位置）：
-        起點原始座標 → 起點最近道路節點 → [道路 shortest path 節點序列]
-        → 停靠點最近道路節點 → 停靠點原始座標
-        →（下一段）由原始座標連回最近道路節點 → [道路 shortest path] → ...
+    路線結構（每個停靠點）：
+        ...上一站離開節點 → [有向道路 shortest path] → 進入節點 u
+        → 沿該道路邊 u→approach→v 行駛（合法方向，經過可抵達的馬路位置）→ 離開節點 v ...
 
-    - 道路主路徑：沿真實 OSM/NetworkX 道路節點（_road_path）。
-    - 接駁段：原始點位↔最近道路節點，以 haversine 直線計算並繪製，代表從道路
-      節點抵達/離開使用者實際選定位置的最後一小段。總距離與時間都包含接駁段。
+    - 主路線：全程沿 directed graph 的 shortest path，遵守道路方向；需要折返時會
+      自然繞經可轉向路口，不會在路段中逆向或瞬移迴轉。polyline 為單一 ordered 序列，
+      可重複經過同一路段，但不分裂成多條分支。
+    - 接駁段：approach（馬路位置）→ 門口原始座標，屬「靠邊停車後步行/牽車」的最後幾公尺，
+      不計入主路線道路距離，另計為 approach_distance（以步行速度估時）。
 
-    回傳 (polyline, 總距離公尺, 總時間秒, 每個 stop 原始座標是否已被 polyline 經過)。
-    若某兩節點間無道路路徑，拋出 networkx.NetworkXNoPath（呼叫端標記為失敗）。
+    回傳 dict：polyline、road_distance_m、road_time_s、approach_distance_m、
+    approach_time_s、arrival_indices（各停靠點 approach 點在 polyline 的索引）、
+    included（各停靠點是否被路線確實抵達）。
+    無道路路徑時拋出 networkx.NetworkXNoPath（呼叫端標記為失敗）。
     """
     eps = 1e-9
     polyline: list[tuple[float, float]] = []
-    total_d = 0.0
-    total_t = 0.0
+    road_d = 0.0
+    road_t = 0.0
+    approach_d = 0.0
+    arrival_indices: list[int] = []
 
     def add_point(pt: tuple[float, float]) -> None:
-        # 跳過與上一點重複的座標（例如原始點位恰好等於節點座標時，避免重複點）
         if (not polyline
                 or abs(polyline[-1][0] - pt[0]) > eps
                 or abs(polyline[-1][1] - pt[1]) > eps):
             polyline.append(pt)
 
-    def add_connector(a: tuple[float, float], b: tuple[float, float]) -> None:
-        nonlocal total_d, total_t
-        d = _haversine_m(a[0], a[1], b[0], b[1])
-        total_d += d
-        total_t += d / speed_mps if speed_mps > 0 else 0.0
-        add_point(b)
-
     start_orig, start_node = start
-    start_node_coord = (graph.nodes[start_node]["y"], graph.nodes[start_node]["x"])
-    add_point(start_orig)                          # 起點原始座標
-    add_connector(start_orig, start_node_coord)    # 接駁：起點原始 → 最近節點
+    add_point((graph.nodes[start_node]["y"], graph.nodes[start_node]["x"]))
 
     prev_node = start_node
-    n = len(stops)
-    for idx, (orig, node) in enumerate(stops):
-        coords, d, t = _road_path(graph, prev_node, node, speed_mps)
-        total_d += d
-        total_t += t
-        for c in coords[1:]:                       # coords[0] 為 prev_node 座標（已在折線中）
+    for orig, approach, enter_u, exit_v in stops:
+        # 1) 由上一站沿有向道路抵達進入節點 u
+        coords, d, t = _road_path(graph, prev_node, enter_u, speed_mps)
+        road_d += d
+        road_t += t
+        for c in coords[1:]:
             add_point(c)
-        node_coord = (graph.nodes[node]["y"], graph.nodes[node]["x"])
-        add_point(node_coord)                      # 確保最近道路節點在折線中
-        add_connector(node_coord, orig)            # 接駁：最近節點 → 停靠點原始座標
-        if idx < n - 1:
-            add_connector(orig, node_coord)        # 下一段：原始座標 → 最近節點
-        prev_node = node
+        # 2) 沿該道路邊 u→approach→v 行駛（合法方向），approach 為實際抵達的馬路位置
+        u_coord = (graph.nodes[enter_u]["y"], graph.nodes[enter_u]["x"])
+        v_coord = (graph.nodes[exit_v]["y"], graph.nodes[exit_v]["x"])
+        seg = (_haversine_m(*u_coord, *approach) + _haversine_m(*approach, *v_coord))
+        road_d += seg
+        road_t += seg / speed_mps if speed_mps > 0 else 0.0
+        add_point(approach)
+        arrival_indices.append(len(polyline) - 1)   # approach 點在 polyline 的索引
+        if (exit_v != enter_u):
+            add_point(v_coord)
+        # 3) 門口接駁段（馬路位置→原始門口）：不計入主路線，另計 approach 距離/時間
+        approach_d += _haversine_m(*approach, orig[0], orig[1])
+        prev_node = exit_v
 
-    # 驗證每個 stop 的原始座標確實出現在 polyline 中（容差 ~1e-7 度 ≈ 1cm）
+    # 驗證每個停靠點的 approach（可抵達馬路位置）確實出現在 polyline 中
     included: list[bool] = []
-    for orig, _node in stops:
+    for _orig, approach, _u, _v in stops:
         hit = any(
-            abs(p[0] - orig[0]) <= 1e-7 and abs(p[1] - orig[1]) <= 1e-7
+            abs(p[0] - approach[0]) <= 1e-7 and abs(p[1] - approach[1]) <= 1e-7
             for p in polyline
         )
         included.append(hit)
-    return polyline, total_d, total_t, included
+
+    approach_t = approach_d / walk_speed_mps if walk_speed_mps > 0 else 0.0
+    return {
+        "polyline": polyline,
+        "road_distance_m": road_d,
+        "road_time_s": road_t,
+        "approach_distance_m": approach_d,
+        "approach_time_s": approach_t,
+        "arrival_indices": arrival_indices,
+        "included": included,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -284,39 +369,41 @@ def compare_algorithms(
     if len(pickups) != len(dropoffs) or len(pickups) == 0:
         raise ValueError("取餐點與送餐點數量必須相同且至少各一個")
 
-    # 確保 graph 邊有 travel_time（route_geometry / _road_path 需要）
+    # 確保 graph 邊有 travel_time（_road_path 需要）
     make_distance_matrix(graph, speed_mps=speed_mps)
 
-    # Snap 到路網節點；同時保留使用者原始點位座標（不可被節點取代）
+    # Snap 到「最近的可行駛有向道路邊」；保留原始門口座標，並記錄可抵達的馬路位置與進/出節點
     orders: list[Order] = []
-    pickup_orig: dict[int, tuple[float, float]] = {}
-    dropoff_orig: dict[int, tuple[float, float]] = {}
+    # stop_meta[(order_id, kind)] = {"orig", "approach", "enter", "exit"}
+    stop_meta: dict[tuple[int, str], dict] = {}
     for i, (pu_latlng, do_latlng) in enumerate(zip(pickups, dropoffs)):
         oid = i + 1
-        pickup_orig[oid] = (pu_latlng[0], pu_latlng[1])
-        dropoff_orig[oid] = (do_latlng[0], do_latlng[1])
-        orders.append(
-            Order(
-                id=oid,
-                restaurant_node=nearest_node(graph, pu_latlng[0], pu_latlng[1]),
-                customer_node=nearest_node(graph, do_latlng[0], do_latlng[1]),
-                place_time=0.0,
-                prep_time=0.0,
-            )
-        )
+        sp = snap_to_edge(graph, pu_latlng[0], pu_latlng[1])
+        sd = snap_to_edge(graph, do_latlng[0], do_latlng[1])
+        stop_meta[(oid, "pickup")] = {
+            "orig": (pu_latlng[0], pu_latlng[1]), "approach": sp["approach"],
+            "enter": sp["enter_node"], "exit": sp["exit_node"],
+        }
+        stop_meta[(oid, "dropoff")] = {
+            "orig": (do_latlng[0], do_latlng[1]), "approach": sd["approach"],
+            "enter": sd["enter_node"], "exit": sd["exit_node"],
+        }
+        orders.append(Order(
+            id=oid,
+            restaurant_node=sp["enter_node"],   # 演算法以 snap 後道路節點排序/計距（核心不變）
+            customer_node=sd["enter_node"],
+            place_time=0.0, prep_time=0.0,
+        ))
 
-    # 司機起點：給定則用給定原始座標；否則以第一張單的取餐點原始座標為起點
+    # 司機起點：給定則 snap 給定座標；否則以第一張單取餐點為起點
     if start is not None:
-        start_node = nearest_node(graph, start[0], start[1])
-        start_orig = (start[0], start[1])
+        ss = snap_to_edge(graph, start[0], start[1])
+        start_node = ss["enter_node"]
+        start_latlng = (start[0], start[1])
     else:
         start_node = orders[0].restaurant_node
-        start_orig = pickup_orig[orders[0].id]
-    start_wp = (start_orig, start_node)
-
-    def orig_of(stop: Stop) -> tuple[float, float]:
-        return (pickup_orig[stop.order_id] if stop.kind == "pickup"
-                else dropoff_orig[stop.order_id])
+        start_latlng = stop_meta[(orders[0].id, "pickup")]["orig"]
+    start_wp = (start_latlng, start_node)
 
     dispatchers = [
         GreedyDispatcher(),
@@ -333,48 +420,57 @@ def compare_algorithms(
         route: list[Stop] = []
 
         try:
-            # 演算法仍以 snap 後的道路節點進行排序與距離計算（核心邏輯不變）。
-            # 只計算規劃時間（不含後續路線幾何）。
+            # 只量測規劃（排序）時間，不含後續路線幾何。
             t0 = time.perf_counter()
             route = plan_full_route(dispatcher, orders, start_node, dist)
             compute_ms = (time.perf_counter() - t0) * 1000.0
 
-            # 將每個 Stop 對應回原始 pickup/dropoff 座標，組成 waypoint
-            stop_wps = [(orig_of(s), s.node) for s in route]
-            polyline, total_dist, total_time, included = build_visited_route(
-                graph, start_wp, stop_wps, speed_mps=speed_mps
-            )
+            metas = [stop_meta[(s.order_id, s.kind)] for s in route]
+            stop_wps = [(m["orig"], m["approach"], m["enter"], m["exit"]) for m in metas]
+            geo = build_visited_route(graph, start_wp, stop_wps, speed_mps=speed_mps)
 
+            included = geo["included"]
+            arrival_idx = geo["arrival_indices"]
             visited_stops: list[dict] = []
-            for s, inc in zip(route, included):
-                orig = orig_of(s)
+            for s, m, inc, aidx in zip(route, metas, included, arrival_idx):
                 visited_stops.append({
                     "order_id": s.order_id,
-                    "kind": s.kind,
+                    "stop_type": s.kind,
                     "kind_zh": "取餐" if s.kind == "pickup" else "送餐",
-                    "original": [orig[0], orig[1]],
-                    "snapped": [graph.nodes[s.node]["y"], graph.nodes[s.node]["x"]],
+                    "original_latlng": [m["orig"][0], m["orig"][1]],
+                    "approach_latlng": [m["approach"][0], m["approach"][1]],
+                    "snapped_node": m["enter"],
+                    "arrival_index_in_polyline": aidx,
                     "included_in_polyline": bool(inc),
+                    "approach_distance_m": _haversine_m(
+                        m["approach"][0], m["approach"][1], m["orig"][0], m["orig"][1]
+                    ),
                 })
 
+            road_d = geo["road_distance_m"]
+            appr_d = geo["approach_distance_m"]
+            total_time = geo["road_time_s"] + geo["approach_time_s"]
+
             if not all(included):
-                missing = [
+                missing = "、".join(
                     f"訂單 {vs['order_id']} 的{vs['kind_zh']}點"
                     for vs in visited_stops if not vs["included_in_polyline"]
-                ]
+                )
                 results.append(AlgoResult(
                     name=algo_name, display_name=display_name, success=False,
-                    total_distance_m=total_dist, total_time_s=total_time,
-                    compute_ms=compute_ms, polyline=polyline, num_stops=len(route),
+                    total_distance_m=road_d + appr_d, road_distance_m=road_d,
+                    approach_distance_m=appr_d, total_time_s=total_time,
+                    compute_ms=compute_ms, polyline=geo["polyline"], num_stops=len(route),
                     visited_stops=visited_stops, all_stops_visited=False,
-                    error="下列點位未被包含在路線中：" + "、".join(missing),
+                    error="下列取餐/送餐點未被路線確實抵達：" + missing,
                 ))
                 continue
 
             results.append(AlgoResult(
                 name=algo_name, display_name=display_name, success=True,
-                total_distance_m=total_dist, total_time_s=total_time,
-                compute_ms=compute_ms, polyline=polyline, num_stops=len(route),
+                total_distance_m=road_d + appr_d, road_distance_m=road_d,
+                approach_distance_m=appr_d, total_time_s=total_time,
+                compute_ms=compute_ms, polyline=geo["polyline"], num_stops=len(route),
                 visited_stops=visited_stops, all_stops_visited=True,
             ))
         except nx.NetworkXNoPath:
@@ -383,7 +479,7 @@ def compare_algorithms(
                 total_distance_m=0.0, total_time_s=0.0, compute_ms=compute_ms,
                 polyline=[], num_stops=len(route), visited_stops=[],
                 all_stops_visited=False,
-                error="部分停靠點之間沒有可行的道路路徑，無法產生完整路線。",
+                error="部分停靠點之間沒有可行的道路路徑（受道路方向限制），無法產生完整路線。",
             ))
         except Exception as exc:
             results.append(AlgoResult(
@@ -466,6 +562,12 @@ def chinese_analysis(results: list[AlgoResult]) -> str:
             f"總距離約 {shortest.total_distance_m:.0f} 公尺，"
             f"但計算時間相對較長（{shortest.compute_ms:.1f} ms）。"
         )
+
+    # 取餐/送餐順序說明：演算法依實際路線成本決定，未必等於點選編號
+    sentences.append(
+        "取餐與送餐順序由演算法依實際路線成本動態決定（已取餐者才可送餐），"
+        "因此實際停靠順序未必等於點選編號（例如較近的訂單可能先取，途中順路也可能先送）。"
+    )
 
     # 整體評語
     if len(successful) == 3:

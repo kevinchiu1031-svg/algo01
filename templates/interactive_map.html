@@ -124,8 +124,8 @@
 
     /* ── 右側資訊面板 ─────────────────────────────── */
     #side-panel {
-      width: 380px;
-      min-width: 300px;
+      width: 460px;
+      min-width: 360px;
       background: #fff;
       border-left: 2px solid #ddd;
       display: flex;
@@ -184,15 +184,17 @@
     #algo-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.80rem;
-      margin-bottom: 14px;
+      font-size: 0.72rem;
+      margin-bottom: 10px;
+      table-layout: fixed;
     }
     #algo-table thead th {
       background: #1a1a2e;
       color: #e2b96e;
-      padding: 6px 8px;
+      padding: 5px 4px;
       text-align: left;
     }
+    #algo-table td { word-break: break-word; }
     #algo-table tbody tr {
       border-bottom: 1px solid #eee;
       cursor: pointer;
