@@ -779,7 +779,10 @@ def test_approx_precedence_repair(dist_factory):
     """構造一個 MST preorder 會違反 precedence 的情境，驗證修補後合法。"""
     o1 = Order(id=1, restaurant_node=10, customer_node=11, place_time=0, prep_time=0)
     o2 = Order(id=2, restaurant_node=20, customer_node=21, place_time=0, prep_time=0)
-    state = DriverState(location_node=0, current_time=0.0, in_hand=[])
+    state = DriverState(
+        location_node=0, current_time=0.0,
+        in_hand=[Stop(1, "pickup", 10), Stop(1, "dropoff", 11)],
+    )
     dist = dist_factory({
         (0, 10): 10, (0, 11): 5, (0, 20): 100, (0, 21): 90,
         (10, 11): 8, (10, 20): 50, (10, 21): 60,
@@ -1020,7 +1023,10 @@ def test_dp_is_oracle_vs_greedy_and_approx(dist_factory):
 def test_dp_route_respects_precedence(dist_factory):
     o1 = Order(1, 10, 11, place_time=0, prep_time=0)
     o2 = Order(2, 20, 21, place_time=0, prep_time=0)
-    state = DriverState(location_node=0, current_time=0.0, in_hand=[])
+    state = DriverState(
+        location_node=0, current_time=0.0,
+        in_hand=[Stop(1, "pickup", 10), Stop(1, "dropoff", 11)],
+    )
     dist = dist_factory({
         (0, 10): 10, (0, 11): 5, (0, 20): 100, (0, 21): 90,
         (10, 11): 8, (10, 20): 50, (10, 21): 60,
