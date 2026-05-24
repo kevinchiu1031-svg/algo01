@@ -7,6 +7,7 @@ import pytest
 
 from delivery.interactive import (
     AlgoResult,
+    build_visited_route,
     chinese_analysis,
     compare_algorithms,
     nearest_node,
@@ -411,7 +412,8 @@ class TestToDict:
         d = r.to_dict()
         expected_keys = {
             "name", "display_name", "success", "total_distance_m",
-            "total_time_s", "compute_ms", "polyline", "num_stops", "error"
+            "total_time_s", "compute_ms", "polyline", "num_stops",
+            "visited_stops", "all_stops_visited", "error"
         }
         assert expected_keys == set(d.keys())
 
@@ -431,3 +433,130 @@ class TestToDict:
         for pt in d["polyline"]:
             assert isinstance(pt, list), f"每個折線點應為 list，實際為 {type(pt)}"
             assert len(pt) == 2
+
+
+# ---------------------------------------------------------------------------
+# 7. 嚴格經過使用者原始點位（接駁段）
+# ---------------------------------------------------------------------------
+class TestStrictVisiting:
+    def _offset_points(self, toy_graph, node_ids, delta):
+        """取節點座標並加上小偏移，模擬使用者點選在節點附近（仍 snap 回該節點）。"""
+        pts = []
+        for nid in node_ids:
+            nd = toy_graph.nodes[nid]
+            pts.append((nd["y"] + delta, nd["x"] + delta))
+        return pts
+
+    def _in_polyline(self, polyline, pt, tol=1e-7):
+        return any(abs(p[0] - pt[0]) <= tol and abs(p[1] - pt[1]) <= tol
+                   for p in polyline)
+
+    def test_build_visited_route_includes_originals(self, toy_graph):
+        """build_visited_route 的 polyline 應包含每個 stop 的原始座標，且 included 全為 True。"""
+        start = ((toy_graph.nodes[0]["y"] + 0.00008, toy_graph.nodes[0]["x"] + 0.00008), 0)
+        stops = [
+            ((toy_graph.nodes[12]["y"] + 0.00008, toy_graph.nodes[12]["x"]), 12),
+            ((toy_graph.nodes[4]["y"], toy_graph.nodes[4]["x"] - 0.00008), 4),
+        ]
+        polyline, dist_m, time_s, included = build_visited_route(
+            toy_graph, start, stops, speed_mps=5.0
+        )
+        assert included == [True, True]
+        for orig, _node in stops:
+            assert self._in_polyline(polyline, orig), f"原始座標 {orig} 應在 polyline 中"
+        assert dist_m > 0 and time_s > 0
+
+    def test_connector_adds_distance(self, toy_graph):
+        """加上接駁段後，總距離應大於僅走道路節點的純道路距離。"""
+        # 純道路（原始座標 == 節點座標，接駁段長度為 0）
+        start_zero = ((toy_graph.nodes[0]["y"], toy_graph.nodes[0]["x"]), 0)
+        stops_zero = [((toy_graph.nodes[24]["y"], toy_graph.nodes[24]["x"]), 24)]
+        _, dist_zero, _, _ = build_visited_route(toy_graph, start_zero, stops_zero, 5.0)
+
+        # 帶偏移（接駁段 > 0）
+        delta = 0.0002
+        start_off = ((toy_graph.nodes[0]["y"] + delta, toy_graph.nodes[0]["x"]), 0)
+        stops_off = [((toy_graph.nodes[24]["y"] - delta, toy_graph.nodes[24]["x"]), 24)]
+        _, dist_off, _, _ = build_visited_route(toy_graph, start_off, stops_off, 5.0)
+
+        assert dist_off > dist_zero, (
+            f"含接駁段距離 {dist_off} 應大於純道路距離 {dist_zero}"
+        )
+
+    def test_compare_algorithms_polyline_passes_through_originals_single(self, toy_graph, toy_dist):
+        """單筆訂單：每個演算法的 polyline 必須通過原始取/送餐座標，visited_stops 全部 included。"""
+        delta = 0.00008  # < 格點間距 0.0005，snap 回原節點，但原始座標保留
+        pickups = self._offset_points(toy_graph, [0], delta)
+        dropoffs = self._offset_points(toy_graph, [24], -delta)
+        results = compare_algorithms(toy_graph, toy_dist, pickups, dropoffs, speed_mps=5.0)
+        assert len(results) == 3
+        for r in results:
+            assert r.success, f"{r.name} 應成功，error={r.error}"
+            assert r.all_stops_visited is True
+            assert self._in_polyline(r.polyline, pickups[0]), f"{r.name}: 取餐原始點應在 polyline"
+            assert self._in_polyline(r.polyline, dropoffs[0]), f"{r.name}: 送餐原始點應在 polyline"
+            assert len(r.visited_stops) == 2
+            for vs in r.visited_stops:
+                assert vs["included_in_polyline"] is True
+                assert "original" in vs and "snapped" in vs and "kind_zh" in vs
+
+    def test_compare_algorithms_polyline_passes_through_originals_multi(self, toy_graph, toy_dist):
+        """多筆訂單：每個原始取/送餐座標都必須出現在 polyline 中。"""
+        delta = 0.00008
+        pickups = self._offset_points(toy_graph, [0, 12, 24], delta)
+        dropoffs = self._offset_points(toy_graph, [8, 18, 4], -delta)
+        results = compare_algorithms(toy_graph, toy_dist, pickups, dropoffs, speed_mps=5.0)
+        for r in results:
+            assert r.success, f"{r.name} 應成功，error={r.error}"
+            assert r.all_stops_visited is True
+            for pt in pickups + dropoffs:
+                assert self._in_polyline(r.polyline, pt), (
+                    f"{r.name}: 原始座標 {pt} 未出現在 polyline 中"
+                )
+            assert all(vs["included_in_polyline"] for vs in r.visited_stops)
+
+    def test_total_distance_includes_connectors_via_compare(self, toy_graph, toy_dist):
+        """compare_algorithms 的總距離應包含接駁段（偏移版 > 無偏移版）。"""
+        p0, p24 = toy_graph.nodes[0], toy_graph.nodes[24]
+        res_zero = compare_algorithms(
+            toy_graph, toy_dist, [(p0["y"], p0["x"])], [(p24["y"], p24["x"])], speed_mps=5.0
+        )
+        delta = 0.0002
+        res_off = compare_algorithms(
+            toy_graph, toy_dist,
+            [(p0["y"] + delta, p0["x"])], [(p24["y"] - delta, p24["x"])], speed_mps=5.0
+        )
+        for rz, ro in zip(res_zero, res_off):
+            assert ro.total_distance_m > rz.total_distance_m, (
+                f"{ro.name}: 含接駁段 {ro.total_distance_m} 應 > 純道路 {rz.total_distance_m}"
+            )
+
+    def _disconnected_graph(self):
+        g = nx.MultiDiGraph()
+        # 兩個彼此不連通的節點（無邊）
+        g.add_node(0, y=25.0000, x=121.0000)
+        g.add_node(1, y=25.0100, x=121.0100)
+        make_distance_matrix(g, speed_mps=5.0)
+        return g
+
+    def test_build_visited_route_raises_on_unreachable(self):
+        """停靠點之間無道路路徑時，build_visited_route 應拋出 NetworkXNoPath。"""
+        g = self._disconnected_graph()
+        with pytest.raises(nx.NetworkXNoPath):
+            build_visited_route(
+                g, ((25.0, 121.0), 0), [((25.01, 121.01), 1)], speed_mps=5.0
+            )
+
+    def test_unreachable_stop_marks_failure_with_chinese_error(self):
+        """停靠點之間無道路路徑時，compare_algorithms 至少有演算法標記失敗，
+        且失敗結果需附中文錯誤訊息（真實 OSM 圖為連通，此為極端情境驗證）。"""
+        g = self._disconnected_graph()
+        dist = make_distance_matrix(g, speed_mps=5.0)
+        results = compare_algorithms(
+            g, dist, [(25.0, 121.0)], [(25.01, 121.01)], speed_mps=5.0
+        )
+        failed = [r for r in results if not r.success]
+        assert failed, "無可行道路時應至少有演算法被標記為失敗"
+        for r in failed:
+            assert r.all_stops_visited is False
+            assert r.error and any("一" <= ch <= "鿿" for ch in r.error)

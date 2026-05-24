@@ -43,8 +43,11 @@ class AlgoResult:
     total_distance_m: float
     total_time_s: float
     compute_ms: float
-    polyline: list[tuple[float, float]]  # 依序 (lat, lng) 沿實際路網節點
+    polyline: list[tuple[float, float]]  # 依序 (lat, lng)：沿實際道路 + 接駁到原始點位
     num_stops: int                     # == 2 * num_orders
+    # 每個停靠點的驗證資訊（取餐/送餐），含原始座標、snap 節點座標、是否已被 polyline 經過
+    visited_stops: list[dict] = field(default_factory=list)
+    all_stops_visited: bool = True     # 是否所有取/送餐點都被路線經過
     error: str | None = None
 
     def to_dict(self) -> dict:
@@ -58,6 +61,8 @@ class AlgoResult:
             "compute_ms": self.compute_ms,
             "polyline": [list(pt) for pt in self.polyline],
             "num_stops": self.num_stops,
+            "visited_stops": self.visited_stops,
+            "all_stops_visited": self.all_stops_visited,
             "error": self.error,
         }
 
@@ -106,64 +111,149 @@ def plan_full_route(
     return state.in_hand
 
 
+def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """兩經緯度間的 haversine 大圓距離（公尺）。
+
+    用於「原始點位↔最近道路節點」的接駁段距離：道路主路徑沿真實道路，
+    接駁段則是從道路節點抵達使用者實際選定位置的最後一小段直線距離。
+    """
+    radius = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def _road_path(
+    graph: nx.MultiDiGraph, u: int, v: int, speed_mps: float
+) -> tuple[list[tuple[float, float]], float, float]:
+    """u→v 沿道路 shortest path（weight='travel_time'）的
+    (座標序列[含 u 與 v 兩端], 道路距離公尺, 道路時間秒)。
+
+    平行邊取 length 最小者。無路徑時拋出 networkx.NetworkXNoPath。
+    """
+    path_nodes: list[int] = nx.shortest_path(graph, u, v, weight="travel_time")
+    dist_m = 0.0
+    time_s = 0.0
+    for i in range(len(path_nodes) - 1):
+        a, b = path_nodes[i], path_nodes[i + 1]
+        min_length = float("inf")
+        min_travel_time = float("inf")
+        for edata in graph[a][b].values():  # MultiDiGraph 平行邊
+            edge_len = edata.get("length", 0.0)
+            edge_tt = edata.get(
+                "travel_time", edge_len / speed_mps if edge_len > 0 else 1.0
+            )
+            if edge_len < min_length:
+                min_length = edge_len
+                min_travel_time = edge_tt
+        dist_m += min_length
+        time_s += min_travel_time
+    coords = [(graph.nodes[n]["y"], graph.nodes[n]["x"]) for n in path_nodes]
+    return coords, dist_m, time_s
+
+
 def route_geometry(
     graph: nx.MultiDiGraph,
     start_node: int,
     route: list[Stop],
     speed_mps: float = 5.0,
 ) -> tuple[list[tuple[float, float]], float, float]:
-    """計算從 start_node 依序訪問 route 各停靠點的實際路網折線、總距離（公尺）
-    及總行駛時間（秒）。
+    """（純道路版）從 start_node 依序走訪 route 各停靠『節點』的道路折線與距離/時間。
 
-    對每段 (u -> v) 使用 networkx.shortest_path(weight='travel_time')，
-    並取平行邊中 length 最短者計算指標。回傳
-    (polyline_latlng, total_distance_m, total_time_s)。
-
-    若某段無路徑，拋出 NetworkXNoPath（呼叫端負責 catch）。
+    僅沿道路節點，不含使用者原始點位的接駁段。保留作為純道路幾何的可重用元件，
+    並由測試驗證道路折線是否正確。實際展示路線請用 build_visited_route。
     """
     if not route:
-        # 無停靠點：只回傳起點座標
-        node_data = graph.nodes[start_node]
-        return ([(node_data["y"], node_data["x"])], 0.0, 0.0)
+        nd = graph.nodes[start_node]
+        return ([(nd["y"], nd["x"])], 0.0, 0.0)
 
     node_sequence = [start_node] + [s.node for s in route]
     polyline: list[tuple[float, float]] = []
     total_distance_m = 0.0
     total_time_s = 0.0
-
     for seg_idx in range(len(node_sequence) - 1):
-        u = node_sequence[seg_idx]
-        v = node_sequence[seg_idx + 1]
-
-        # 取最短路徑（以 travel_time 為權重）
-        path_nodes: list[int] = nx.shortest_path(
-            graph, u, v, weight="travel_time"
+        coords, d, t = _road_path(
+            graph, node_sequence[seg_idx], node_sequence[seg_idx + 1], speed_mps
         )
-
-        # 逐段累積距離與時間（取平行邊最小 length）
-        for i in range(len(path_nodes) - 1):
-            a, b = path_nodes[i], path_nodes[i + 1]
-            edge_data_dict = graph[a][b]  # MultiDiGraph: {key: data_dict}
-            # 選 length 最小的平行邊
-            min_length = float("inf")
-            min_travel_time = float("inf")
-            for key, edata in edge_data_dict.items():
-                edge_len = edata.get("length", 0.0)
-                edge_tt = edata.get("travel_time", edge_len / speed_mps if edge_len > 0 else 1.0)
-                if edge_len < min_length:
-                    min_length = edge_len
-                    min_travel_time = edge_tt
-            total_distance_m += min_length
-            total_time_s += min_travel_time
-
-        # 建立折線座標（避免相鄰 segment 的連接節點重複）
-        for i, node_id in enumerate(path_nodes):
-            # 第一個 segment 的起點加入；之後各 segment 跳過第一個節點（已是上段終點）
-            if seg_idx == 0 or i > 0:
-                nd = graph.nodes[node_id]
-                polyline.append((nd["y"], nd["x"]))
-
+        total_distance_m += d
+        total_time_s += t
+        # 第一段加入全部座標；之後各段跳過第一個（與上段終點重複）
+        polyline.extend(coords if seg_idx == 0 else coords[1:])
     return polyline, total_distance_m, total_time_s
+
+
+def build_visited_route(
+    graph: nx.MultiDiGraph,
+    start: tuple[tuple[float, float], int],
+    stops: list[tuple[tuple[float, float], int]],
+    speed_mps: float = 5.0,
+) -> tuple[list[tuple[float, float]], float, float, list[bool]]:
+    """建立「嚴格經過每個使用者原始點位」的完整路線。
+
+    start 與每個 stop 皆為 (原始經緯度 (lat,lng), snap 後最近道路節點)。
+
+    完整路線結構（確保 polyline 視覺上真正經過使用者點選的位置）：
+        起點原始座標 → 起點最近道路節點 → [道路 shortest path 節點序列]
+        → 停靠點最近道路節點 → 停靠點原始座標
+        →（下一段）由原始座標連回最近道路節點 → [道路 shortest path] → ...
+
+    - 道路主路徑：沿真實 OSM/NetworkX 道路節點（_road_path）。
+    - 接駁段：原始點位↔最近道路節點，以 haversine 直線計算並繪製，代表從道路
+      節點抵達/離開使用者實際選定位置的最後一小段。總距離與時間都包含接駁段。
+
+    回傳 (polyline, 總距離公尺, 總時間秒, 每個 stop 原始座標是否已被 polyline 經過)。
+    若某兩節點間無道路路徑，拋出 networkx.NetworkXNoPath（呼叫端標記為失敗）。
+    """
+    eps = 1e-9
+    polyline: list[tuple[float, float]] = []
+    total_d = 0.0
+    total_t = 0.0
+
+    def add_point(pt: tuple[float, float]) -> None:
+        # 跳過與上一點重複的座標（例如原始點位恰好等於節點座標時，避免重複點）
+        if (not polyline
+                or abs(polyline[-1][0] - pt[0]) > eps
+                or abs(polyline[-1][1] - pt[1]) > eps):
+            polyline.append(pt)
+
+    def add_connector(a: tuple[float, float], b: tuple[float, float]) -> None:
+        nonlocal total_d, total_t
+        d = _haversine_m(a[0], a[1], b[0], b[1])
+        total_d += d
+        total_t += d / speed_mps if speed_mps > 0 else 0.0
+        add_point(b)
+
+    start_orig, start_node = start
+    start_node_coord = (graph.nodes[start_node]["y"], graph.nodes[start_node]["x"])
+    add_point(start_orig)                          # 起點原始座標
+    add_connector(start_orig, start_node_coord)    # 接駁：起點原始 → 最近節點
+
+    prev_node = start_node
+    n = len(stops)
+    for idx, (orig, node) in enumerate(stops):
+        coords, d, t = _road_path(graph, prev_node, node, speed_mps)
+        total_d += d
+        total_t += t
+        for c in coords[1:]:                       # coords[0] 為 prev_node 座標（已在折線中）
+            add_point(c)
+        node_coord = (graph.nodes[node]["y"], graph.nodes[node]["x"])
+        add_point(node_coord)                      # 確保最近道路節點在折線中
+        add_connector(node_coord, orig)            # 接駁：最近節點 → 停靠點原始座標
+        if idx < n - 1:
+            add_connector(orig, node_coord)        # 下一段：原始座標 → 最近節點
+        prev_node = node
+
+    # 驗證每個 stop 的原始座標確實出現在 polyline 中（容差 ~1e-7 度 ≈ 1cm）
+    included: list[bool] = []
+    for orig, _node in stops:
+        hit = any(
+            abs(p[0] - orig[0]) <= 1e-7 and abs(p[1] - orig[1]) <= 1e-7
+            for p in polyline
+        )
+        included.append(hit)
+    return polyline, total_d, total_t, included
 
 
 # ---------------------------------------------------------------------------
@@ -194,34 +284,40 @@ def compare_algorithms(
     if len(pickups) != len(dropoffs) or len(pickups) == 0:
         raise ValueError("取餐點與送餐點數量必須相同且至少各一個")
 
-    # Snap 到路網節點
+    # 確保 graph 邊有 travel_time（route_geometry / _road_path 需要）
+    make_distance_matrix(graph, speed_mps=speed_mps)
+
+    # Snap 到路網節點；同時保留使用者原始點位座標（不可被節點取代）
     orders: list[Order] = []
+    pickup_orig: dict[int, tuple[float, float]] = {}
+    dropoff_orig: dict[int, tuple[float, float]] = {}
     for i, (pu_latlng, do_latlng) in enumerate(zip(pickups, dropoffs)):
-        rest_node = nearest_node(graph, pu_latlng[0], pu_latlng[1])
-        cust_node = nearest_node(graph, do_latlng[0], do_latlng[1])
+        oid = i + 1
+        pickup_orig[oid] = (pu_latlng[0], pu_latlng[1])
+        dropoff_orig[oid] = (do_latlng[0], do_latlng[1])
         orders.append(
             Order(
-                id=i + 1,
-                restaurant_node=rest_node,
-                customer_node=cust_node,
+                id=oid,
+                restaurant_node=nearest_node(graph, pu_latlng[0], pu_latlng[1]),
+                customer_node=nearest_node(graph, do_latlng[0], do_latlng[1]),
                 place_time=0.0,
                 prep_time=0.0,
             )
         )
 
-    # 司機起點
+    # 司機起點：給定則用給定原始座標；否則以第一張單的取餐點原始座標為起點
     if start is not None:
         start_node = nearest_node(graph, start[0], start[1])
+        start_orig = (start[0], start[1])
     else:
         start_node = orders[0].restaurant_node
+        start_orig = pickup_orig[orders[0].id]
+    start_wp = (start_orig, start_node)
 
-    # 確認 make_distance_matrix 已更新 travel_time（若未更新則重跑一次）
-    # 注意：若 dist 已由外部建立，edges 可能已有 travel_time；
-    # 直接使用傳入的 dist，route_geometry 需要 graph edges 有 travel_time。
-    # 為保險，呼叫 make_distance_matrix 更新邊屬性（不重建 dist）。
-    make_distance_matrix(graph, speed_mps=speed_mps)
+    def orig_of(stop: Stop) -> tuple[float, float]:
+        return (pickup_orig[stop.order_id] if stop.kind == "pickup"
+                else dropoff_orig[stop.order_id])
 
-    # 建立三個 dispatcher
     dispatchers = [
         GreedyDispatcher(),
         TspApproxDispatcher(),
@@ -237,42 +333,66 @@ def compare_algorithms(
         route: list[Stop] = []
 
         try:
-            # 只計算規劃時間（不含 route_geometry）
+            # 演算法仍以 snap 後的道路節點進行排序與距離計算（核心邏輯不變）。
+            # 只計算規劃時間（不含後續路線幾何）。
             t0 = time.perf_counter()
             route = plan_full_route(dispatcher, orders, start_node, dist)
-            t1 = time.perf_counter()
-            compute_ms = (t1 - t0) * 1000.0
+            compute_ms = (time.perf_counter() - t0) * 1000.0
 
-            polyline, total_dist, total_time = route_geometry(
-                graph, start_node, route, speed_mps=speed_mps
+            # 將每個 Stop 對應回原始 pickup/dropoff 座標，組成 waypoint
+            stop_wps = [(orig_of(s), s.node) for s in route]
+            polyline, total_dist, total_time, included = build_visited_route(
+                graph, start_wp, stop_wps, speed_mps=speed_mps
             )
 
-            results.append(
-                AlgoResult(
-                    name=algo_name,
-                    display_name=display_name,
-                    success=True,
-                    total_distance_m=total_dist,
-                    total_time_s=total_time,
-                    compute_ms=compute_ms,
-                    polyline=polyline,
-                    num_stops=len(route),
-                )
-            )
+            visited_stops: list[dict] = []
+            for s, inc in zip(route, included):
+                orig = orig_of(s)
+                visited_stops.append({
+                    "order_id": s.order_id,
+                    "kind": s.kind,
+                    "kind_zh": "取餐" if s.kind == "pickup" else "送餐",
+                    "original": [orig[0], orig[1]],
+                    "snapped": [graph.nodes[s.node]["y"], graph.nodes[s.node]["x"]],
+                    "included_in_polyline": bool(inc),
+                })
+
+            if not all(included):
+                missing = [
+                    f"訂單 {vs['order_id']} 的{vs['kind_zh']}點"
+                    for vs in visited_stops if not vs["included_in_polyline"]
+                ]
+                results.append(AlgoResult(
+                    name=algo_name, display_name=display_name, success=False,
+                    total_distance_m=total_dist, total_time_s=total_time,
+                    compute_ms=compute_ms, polyline=polyline, num_stops=len(route),
+                    visited_stops=visited_stops, all_stops_visited=False,
+                    error="下列點位未被包含在路線中：" + "、".join(missing),
+                ))
+                continue
+
+            results.append(AlgoResult(
+                name=algo_name, display_name=display_name, success=True,
+                total_distance_m=total_dist, total_time_s=total_time,
+                compute_ms=compute_ms, polyline=polyline, num_stops=len(route),
+                visited_stops=visited_stops, all_stops_visited=True,
+            ))
+        except nx.NetworkXNoPath:
+            results.append(AlgoResult(
+                name=algo_name, display_name=display_name, success=False,
+                total_distance_m=0.0, total_time_s=0.0, compute_ms=compute_ms,
+                polyline=[], num_stops=len(route), visited_stops=[],
+                all_stops_visited=False,
+                error="部分停靠點之間沒有可行的道路路徑，無法產生完整路線。",
+            ))
         except Exception as exc:
-            results.append(
-                AlgoResult(
-                    name=algo_name,
-                    display_name=display_name,
-                    success=False,
-                    total_distance_m=0.0,
-                    total_time_s=0.0,
-                    compute_ms=compute_ms,
-                    polyline=[],
-                    num_stops=len(route),
-                    error=str(exc),
-                )
-            )
+            results.append(AlgoResult(
+                name=algo_name, display_name=display_name, success=False,
+                total_distance_m=0.0, total_time_s=0.0, compute_ms=compute_ms,
+                polyline=[], num_stops=len(route), visited_stops=[],
+                all_stops_visited=False,
+                error=f"路線規劃發生錯誤：{exc}",
+            ))
 
     return results
 

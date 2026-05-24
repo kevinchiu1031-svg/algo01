@@ -207,6 +207,14 @@ function renderResults(data) {
   // ── 建立 HTML ────────────────────────────────────────────────────────────
   let html = `<h2>演算法比較</h2>`;
 
+  // 取/送餐點是否皆已被路線經過
+  const allVisited = results.every(r => r.all_stops_visited);
+  html += `<p style="font-size:0.85rem;font-weight:bold;padding:6px 8px;border-radius:4px;margin-bottom:10px;`
+        + (allVisited
+            ? `background:#e8f8ef;color:#1e7e44;">✓ 所有取餐／送餐點皆已被路線經過`
+            : `background:#fde8e8;color:#c0392b;">⚠ 有取餐／送餐點未被路線包含，詳見下表「結果說明」`)
+        + `</p>`;
+
   // 路線圖例
   html += `<div id="route-legend"><h3>路線圖例</h3>`;
   results.forEach((r, i) => {
@@ -238,8 +246,8 @@ function renderResults(data) {
     const timeStr = r.success ? fmtTime(r.total_time_s)     : "—";
     const compStr = r.compute_ms.toFixed(2) + " 毫秒";
     const resultStr = r.success
-      ? `成功（共 ${r.num_stops} 個停靠點）`
-      : `失敗：${r.error}`;
+      ? `成功（${r.num_stops} 個停靠點，皆已經過）`
+      : `失敗：${r.error || ""}`;
     const colorDot = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${ALGO_COLORS[i]};margin-right:5px;"></span>`;
     html += `
       <tr onclick="highlightRoute(${i})" id="algo-row-${i}">
