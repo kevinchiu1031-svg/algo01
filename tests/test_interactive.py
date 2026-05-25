@@ -267,6 +267,100 @@ class TestCompareAlgorithms:
             )
 
 
+class TestPrepTime:
+    """餐點製作時間（prep_time）與騎手等待成本的整合測試。"""
+
+    def _two_orders(self, g):
+        pickups = [
+            (g.nodes[0]["y"], g.nodes[0]["x"]),
+            (g.nodes[24]["y"], g.nodes[24]["x"]),
+        ]
+        dropoffs = [
+            (g.nodes[4]["y"], g.nodes[4]["x"]),
+            (g.nodes[20]["y"], g.nodes[20]["x"]),
+        ]
+        return pickups, dropoffs
+
+    def test_orders_info_carries_prep_time(self, toy_graph, toy_dist):
+        """每個結果應帶有 orders_info，含各訂單製作時間（分）與 ready 秒數。"""
+        pickups, dropoffs = self._two_orders(toy_graph)
+        results = compare_algorithms(
+            toy_graph, toy_dist, pickups, dropoffs,
+            prep_times_min=[10, 0], speed_mps=5.0,
+        )
+        for r in results:
+            assert len(r.orders_info) == 2
+            assert r.orders_info[0]["prep_time_min"] == 10
+            assert r.orders_info[0]["ready_time_s"] == 600.0
+            assert r.orders_info[1]["prep_time_min"] == 0
+
+    def test_zero_prep_means_no_wait(self, toy_graph, toy_dist):
+        """所有 prep_time=0 → 騎手不需在餐廳等待，total_wait_s 應為 0。"""
+        pickups, dropoffs = self._two_orders(toy_graph)
+        results = compare_algorithms(
+            toy_graph, toy_dist, pickups, dropoffs,
+            prep_times_min=[0, 0], speed_mps=5.0,
+        )
+        for r in results:
+            assert r.total_wait_s == 0.0
+            assert r.exceeds_wait_tolerance is False
+
+    def test_pickup_stops_report_wait(self, toy_graph, toy_dist):
+        """很長的製作時間 → 對應取餐點 visited_stops 應記錄 wait_s > 0。"""
+        pickups, dropoffs = self._two_orders(toy_graph)
+        results = compare_algorithms(
+            toy_graph, toy_dist, pickups, dropoffs,
+            prep_times_min=[25, 0], speed_mps=5.0,
+        )
+        dp = next(r for r in results if r.name == "dp")
+        pickup_waits = {
+            vs["order_id"]: vs["wait_s"]
+            for vs in dp.visited_stops if vs["stop_type"] == "pickup"
+        }
+        assert pickup_waits[1] > 0  # 25 分鐘備餐，騎手必然得等
+        assert pickup_waits[2] == 0
+
+    def test_to_dict_includes_prep_fields(self, toy_graph, toy_dist):
+        """to_dict 應序列化新欄位，供前端使用。"""
+        pickups, dropoffs = self._two_orders(toy_graph)
+        results = compare_algorithms(
+            toy_graph, toy_dist, pickups, dropoffs,
+            prep_times_min=[10, 5], speed_mps=5.0,
+        )
+        d = results[0].to_dict()
+        assert "total_wait_s" in d
+        assert "exceeds_wait_tolerance" in d
+        assert "orders_info" in d
+        assert d["orders_info"][0]["prep_time_min"] == 10
+        assert "wait_s" in d["visited_stops"][0]
+
+    def test_prep_times_length_mismatch_raises(self, toy_graph, toy_dist):
+        pickups, dropoffs = self._two_orders(toy_graph)
+        with pytest.raises(ValueError, match="製作時間"):
+            compare_algorithms(
+                toy_graph, toy_dist, pickups, dropoffs,
+                prep_times_min=[10], speed_mps=5.0,
+            )
+
+    @pytest.mark.parametrize("bad", [-1, 26, 30])
+    def test_prep_times_out_of_range_raises(self, toy_graph, toy_dist, bad):
+        pickups, dropoffs = self._two_orders(toy_graph)
+        with pytest.raises(ValueError, match="0.*25|製作時間"):
+            compare_algorithms(
+                toy_graph, toy_dist, pickups, dropoffs,
+                prep_times_min=[bad, 0], speed_mps=5.0,
+            )
+
+    def test_default_prep_times_none_no_wait(self, toy_graph, toy_dist):
+        """未提供 prep_times_min（既有呼叫者）→ 視為 0，行為與從前一致。"""
+        pickups, dropoffs = self._two_orders(toy_graph)
+        results = compare_algorithms(
+            toy_graph, toy_dist, pickups, dropoffs, speed_mps=5.0,
+        )
+        for r in results:
+            assert r.total_wait_s == 0.0
+
+
 # ---------------------------------------------------------------------------
 # 5. chinese_analysis
 # ---------------------------------------------------------------------------
@@ -378,6 +472,35 @@ class TestChineseAnalysis:
         )
         assert "新增" not in text, "多訂單不應出現單一訂單的提示語"
 
+    def test_multi_order_mentions_rider_wait(self):
+        """多訂單且各演算法騎手等待不同時，分析應提及『等待』並指名等待最少者。"""
+        results = [
+            self._make_result("greedy", compute_ms=1.0, dist=1300.0),
+            self._make_result("tsp_approx", compute_ms=0.4, dist=1300.0),
+            self._make_result("dp", compute_ms=0.6, dist=1300.0),
+        ]
+        results[0].num_stops = results[1].num_stops = results[2].num_stops = 6
+        results[0].total_wait_s = 400.0
+        results[1].total_wait_s = 250.0
+        results[2].total_wait_s = 0.0  # DP 等待最少
+        text = chinese_analysis(results)
+        assert "等待" in text, f"應提及騎手等待，實際：{text!r}"
+        assert results[2].display_name in text
+
+    def test_warns_when_wait_exceeds_tolerance(self):
+        """任一演算法等待超過容忍門檻時，分析應提出警示（提到『3 分鐘』或『超過』）。"""
+        results = [
+            self._make_result("greedy", compute_ms=1.0, dist=1300.0),
+            self._make_result("tsp_approx", compute_ms=0.4, dist=1300.0),
+            self._make_result("dp", compute_ms=0.6, dist=1300.0),
+        ]
+        for r in results:
+            r.num_stops = 6
+        results[0].total_wait_s = 500.0
+        results[0].exceeds_wait_tolerance = True
+        text = chinese_analysis(results)
+        assert ("3 分鐘" in text or "超過" in text), f"應警示超時等待：{text!r}"
+
 
 # ---------------------------------------------------------------------------
 # 6. to_dict / JSON 序列化
@@ -418,7 +541,8 @@ class TestToDict:
             "name", "display_name", "success", "total_distance_m",
             "road_distance_m", "approach_distance_m",
             "total_time_s", "compute_ms", "polyline", "num_stops",
-            "visited_stops", "all_stops_visited", "error"
+            "total_wait_s", "total_driver_time_s", "exceeds_wait_tolerance",
+            "orders_info", "visited_stops", "all_stops_visited", "error"
         }
         assert expected_keys == set(d.keys())
 

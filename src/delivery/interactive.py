@@ -13,13 +13,19 @@ from delivery.algorithms.dp import DpDispatcher
 from delivery.algorithms.greedy import GreedyDispatcher
 from delivery.algorithms.tsp_approx import TspApproxDispatcher
 from delivery.map_loader import make_distance_matrix
+from delivery.metrics import route_timeline
 from delivery.models import (
+    WAIT_TOLERANCE_S,
     Decision,
     DistanceMatrix,
     DriverState,
     Order,
     Stop,
 )
+
+# 餐點製作時間允許範圍（分鐘）
+PREP_TIME_MIN_MINUTES = 0.0
+PREP_TIME_MAX_MINUTES = 25.0
 
 # ---------------------------------------------------------------------------
 # 顯示名稱
@@ -46,6 +52,11 @@ class AlgoResult:
     num_stops: int                     # == 2 * num_orders
     road_distance_m: float = 0.0       # 主路線距離（沿有向道路 shortest path）
     approach_distance_m: float = 0.0   # 停靠接近距離（馬路位置→門口的最後一小段，總和）
+    # 餐點製作時間 / 騎手等待相關
+    total_wait_s: float = 0.0          # 騎手在各餐廳的等待秒數總和（餐未好的空等）
+    total_driver_time_s: float = 0.0   # 騎手總時間（行駛 + 等待），由 dist 矩陣推算
+    exceeds_wait_tolerance: bool = False  # 是否有任一取餐點等待超過容忍門檻
+    orders_info: list[dict] = field(default_factory=list)  # 各訂單 prep_time / ready 資訊
     # 每個停靠點的驗證資訊（取餐/送餐）
     visited_stops: list[dict] = field(default_factory=list)
     all_stops_visited: bool = True     # 是否所有取/送餐點都被路線確實抵達
@@ -62,6 +73,10 @@ class AlgoResult:
             "approach_distance_m": self.approach_distance_m,
             "total_time_s": self.total_time_s,
             "compute_ms": self.compute_ms,
+            "total_wait_s": self.total_wait_s,
+            "total_driver_time_s": self.total_driver_time_s,
+            "exceeds_wait_tolerance": self.exceeds_wait_tolerance,
+            "orders_info": self.orders_info,
             "polyline": [list(pt) for pt in self.polyline],
             "num_stops": self.num_stops,
             "visited_stops": self.visited_stops,
@@ -458,6 +473,33 @@ def _unreached_stops_message(visited_stops: list[dict]) -> str:
     return "下列取餐/送餐點未被路線確實抵達：" + missing
 
 
+def _validate_prep_times(
+    prep_times_min: list[float] | None, num_orders: int
+) -> list[float]:
+    """檢核並回傳每筆訂單的製作時間（分鐘）。
+
+    None → 全部視為 0（保持既有呼叫者行為不變）。長度須等於訂單數，
+    每筆須落在 [0, 25] 分鐘。
+    """
+    if prep_times_min is None:
+        return [0.0] * num_orders
+    if len(prep_times_min) != num_orders:
+        raise ValueError(
+            f"製作時間數量（{len(prep_times_min)}）須等於訂單數（{num_orders}）"
+        )
+    cleaned: list[float] = []
+    for p in prep_times_min:
+        if not isinstance(p, (int, float)) or not (
+            PREP_TIME_MIN_MINUTES <= p <= PREP_TIME_MAX_MINUTES
+        ):
+            raise ValueError(
+                f"餐點製作時間須為 {PREP_TIME_MIN_MINUTES:.0f}～"
+                f"{PREP_TIME_MAX_MINUTES:.0f} 分鐘之間的數字，收到：{p}"
+            )
+        cleaned.append(float(p))
+    return cleaned
+
+
 def compare_algorithms(
     graph: nx.MultiDiGraph,
     dist: DistanceMatrix,
@@ -465,16 +507,19 @@ def compare_algorithms(
     dropoffs: list[tuple[float, float]],
     start: tuple[float, float] | None = None,
     speed_mps: float = 5.0,
+    prep_times_min: list[float] | None = None,
 ) -> list[AlgoResult]:
     """接收一組取餐/送餐點（lat, lng），snap 到路網，
     分別以三種演算法規劃路線並回傳比較結果。
 
     參數
     ----
-    pickups   : 取餐點 [(lat, lng), ...]
-    dropoffs  : 送餐點 [(lat, lng), ...]，與 pickups 一一對應
-    start     : 司機起點 (lat, lng)；若為 None 則以第一個取餐節點為起點
-    speed_mps : 行駛速度（公尺/秒），預設 5.0
+    pickups        : 取餐點 [(lat, lng), ...]
+    dropoffs       : 送餐點 [(lat, lng), ...]，與 pickups 一一對應
+    start          : 司機起點 (lat, lng)；若為 None 則以第一個取餐節點為起點
+    speed_mps      : 行駛速度（公尺/秒），預設 5.0
+    prep_times_min : 各訂單餐點製作時間（分鐘），與 pickups 一一對應；範圍 0～25。
+                     None 表示全部 0（餐點立即可取，不需等待）。
 
     回傳
     ----
@@ -482,6 +527,8 @@ def compare_algorithms(
     """
     if len(pickups) != len(dropoffs) or len(pickups) == 0:
         raise ValueError("取餐點與送餐點數量必須相同且至少各一個")
+
+    prep_times = _validate_prep_times(prep_times_min, len(pickups))
 
     # 確保 graph 邊有 travel_time（_road_path 需要）
     make_distance_matrix(graph, speed_mps=speed_mps)
@@ -507,12 +554,24 @@ def compare_algorithms(
         # 已知建模簡化：dispatcher 以 enter_node 的有向最短距離排序停靠點，
         # 但實際繪製的路線還包含「邊內 u→approach→v」接近段；因此演算法最佳化的
         # 成本只是所顯示 road_distance_m 的近似值（兩者排序通常一致，量值略有差距）。
+        # 互動模式下所有訂單於 t=0 同時下單，餐點於 prep_time 後做好（food_ready_time）。
+        prep_seconds = prep_times[i] * 60.0
         orders.append(Order(
             id=oid,
             restaurant_node=sp["enter_node"],   # 演算法以 snap 後道路節點排序/計距（核心不變）
             customer_node=sd["enter_node"],
-            place_time=0.0, prep_time=0.0,
+            place_time=0.0, prep_time=prep_seconds,
         ))
+
+    orders_by_id: dict[int, Order] = {o.id: o for o in orders}
+    orders_info = [
+        {
+            "order_id": o.id,
+            "prep_time_min": prep_times[o.id - 1],
+            "ready_time_s": o.food_ready_time,
+        }
+        for o in orders
+    ]
 
     # 司機起點：給定則 snap 給定座標；否則以第一張單取餐點為起點
     if start is not None:
@@ -552,10 +611,33 @@ def compare_algorithms(
             ]
             geo = build_visited_route(graph, start_wp, stop_wps, speed_mps=speed_mps)
 
+            # 沿規劃路線推進時鐘（與 dispatcher 採用的同一 dist 矩陣），
+            # 計算各取餐點的等待秒數與騎手總時間（行駛＋等待）。
+            sim_state = DriverState(
+                location_node=start_node, current_time=0.0, in_hand=[]
+            )
+            timeline = route_timeline(route, sim_state, orders_by_id, dist)
+            total_wait_s = 0.0
+            exceeds_tol = False
+            for entry in timeline:
+                if entry.stop.kind == "pickup":
+                    w = entry.departure_time - entry.arrival_time
+                    total_wait_s += w
+                    if w > WAIT_TOLERANCE_S:
+                        exceeds_tol = True
+            total_driver_time_s = (
+                timeline[-1].departure_time - sim_state.current_time
+                if timeline else 0.0
+            )
+
             included = geo["included"]
             arrival_idx = geo["arrival_indices"]
             visited_stops: list[dict] = []
-            for s, m, inc, aidx in zip(route, metas, included, arrival_idx):
+            for s, m, inc, aidx, entry in zip(
+                route, metas, included, arrival_idx, timeline
+            ):
+                wait_s = (entry.departure_time - entry.arrival_time
+                          if s.kind == "pickup" else 0.0)
                 visited_stops.append({
                     "order_id": s.order_id,
                     "stop_type": s.kind,
@@ -568,6 +650,9 @@ def compare_algorithms(
                     "approach_distance_m": _haversine_m(
                         m["approach"][0], m["approach"][1], m["orig"][0], m["orig"][1]
                     ),
+                    "arrival_time_s": entry.arrival_time,
+                    "departure_time_s": entry.departure_time,
+                    "wait_s": wait_s,
                 })
 
             road_d = geo["road_distance_m"]
@@ -580,6 +665,8 @@ def compare_algorithms(
                     total_distance_m=road_d + appr_d, road_distance_m=road_d,
                     approach_distance_m=appr_d, total_time_s=total_time,
                     compute_ms=compute_ms, polyline=geo["polyline"], num_stops=len(route),
+                    total_wait_s=total_wait_s, total_driver_time_s=total_driver_time_s,
+                    exceeds_wait_tolerance=exceeds_tol, orders_info=orders_info,
                     visited_stops=visited_stops, all_stops_visited=False,
                     error=_unreached_stops_message(visited_stops),
                 ))
@@ -590,22 +677,24 @@ def compare_algorithms(
                 total_distance_m=road_d + appr_d, road_distance_m=road_d,
                 approach_distance_m=appr_d, total_time_s=total_time,
                 compute_ms=compute_ms, polyline=geo["polyline"], num_stops=len(route),
+                total_wait_s=total_wait_s, total_driver_time_s=total_driver_time_s,
+                exceeds_wait_tolerance=exceeds_tol, orders_info=orders_info,
                 visited_stops=visited_stops, all_stops_visited=True,
             ))
         except nx.NetworkXNoPath:
             results.append(AlgoResult(
                 name=algo_name, display_name=display_name, success=False,
                 total_distance_m=0.0, total_time_s=0.0, compute_ms=compute_ms,
-                polyline=[], num_stops=len(route), visited_stops=[],
-                all_stops_visited=False,
+                polyline=[], num_stops=len(route), orders_info=orders_info,
+                visited_stops=[], all_stops_visited=False,
                 error="部分停靠點之間沒有可行的道路路徑（受道路方向限制），無法產生完整路線。",
             ))
         except Exception as exc:
             results.append(AlgoResult(
                 name=algo_name, display_name=display_name, success=False,
                 total_distance_m=0.0, total_time_s=0.0, compute_ms=compute_ms,
-                polyline=[], num_stops=len(route), visited_stops=[],
-                all_stops_visited=False,
+                polyline=[], num_stops=len(route), orders_info=orders_info,
+                visited_stops=[], all_stops_visited=False,
                 error=f"路線規劃發生錯誤：{exc}",
             ))
 
@@ -615,6 +704,40 @@ def compare_algorithms(
 # ---------------------------------------------------------------------------
 # 中文分析文字生成
 # ---------------------------------------------------------------------------
+def _wait_sentences(successful: list[AlgoResult]) -> list[str]:
+    """產生「騎手等待成本」相關的中文分析句（多訂單情境用）。
+
+    - 全程幾乎無等待：肯定其符合「只在前往取餐／送餐途中」的目標。
+    - 否則指名等待最少的演算法及其等待秒數。
+    - 若有任一演算法在餐廳等待超過容忍門檻（3 分鐘），提出警示。
+    """
+    tol_min = WAIT_TOLERANCE_S / 60.0
+    out: list[str] = []
+    least_wait = min(successful, key=lambda r: r.total_wait_s)
+    most_wait = max(successful, key=lambda r: r.total_wait_s)
+
+    if most_wait.total_wait_s < 1.0:
+        out.append(
+            "此規劃下騎手全程幾乎無需在餐廳空等，符合「狀態盡量只有前往取餐或前往送餐途中」的目標。"
+        )
+    else:
+        out.append(
+            f"就騎手等待成本而言，{least_wait.display_name} 在餐廳的等待最少"
+            f"（約 {least_wait.total_wait_s:.0f} 秒）；演算法會盡量調整停靠順序，"
+            f"先去做其他順路的事，避免在餐廳乾等。"
+        )
+
+    exceeded = [r for r in successful if r.exceeds_wait_tolerance]
+    if exceeded:
+        names = "、".join(r.display_name for r in exceeded)
+        out.append(
+            f"注意：{names} 仍有取餐點需等待超過容忍門檻（{tol_min:.0f} 分鐘），"
+            f"通常代表該筆餐點製作時間過長或附近無其他順路任務可做，"
+            f"建議調整該訂單的製作時間或增加可調度的訂單。"
+        )
+    return out
+
+
 def chinese_analysis(results: list[AlgoResult]) -> str:
     """依三種演算法的結果生成繁體中文分析文字（2–4 句）。
     指出計算最快的演算法、路徑最短的演算法，及整體評語。
@@ -664,6 +787,7 @@ def chinese_analysis(results: list[AlgoResult]) -> str:
             f"{shortest.total_distance_m:.0f} 公尺），主要差異在於計算時間；"
             f"其中 {fastest.display_name} 計算速度最快（耗時 {fastest.compute_ms:.2f} ms）。"
         )
+        sentences.extend(_wait_sentences(successful))
         return "".join(sentences)
 
     if fastest.name == shortest.name:
@@ -687,6 +811,9 @@ def chinese_analysis(results: list[AlgoResult]) -> str:
         "取餐與送餐順序由演算法依實際路線成本動態決定（已取餐者才可送餐），"
         "因此實際停靠順序未必等於點選編號（例如較近的訂單可能先取，途中順路也可能先送）。"
     )
+
+    # 騎手等待成本說明
+    sentences.extend(_wait_sentences(successful))
 
     # 整體評語
     if len(successful) == 3:

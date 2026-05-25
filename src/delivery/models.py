@@ -2,6 +2,13 @@
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Protocol
 
+# 騎手在餐廳可容忍的最長等待秒數（3 分鐘）。超過此門檻的等待視為「空等」，
+# 演算法應盡量改變停靠順序去做其他有用的事，而非在餐廳乾等。
+WAIT_TOLERANCE_S = 180.0
+# 對「超過容忍門檻」的等待秒數施加的成本權重：每多等 1 秒額外計為此倍數，
+# 讓演算法願意多花一點行駛時間來避免長時間空等（順路的短暫等待則不受罰）。
+WAIT_OVERAGE_WEIGHT = 5.0
+
 
 @dataclass(frozen=True)
 class Order:

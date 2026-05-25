@@ -12,7 +12,16 @@ let routePolylines  = {};            // {resultsIndex: L.Polyline}
 let snappedMarkers  = [];            // L.CircleMarker[] (snapped 點)
 let highlightedIdx  = -1;            // 目前高亮的演算法 index
 
+let prepTimes       = [];            // 各訂單餐點製作時間（分鐘），index 對應取餐點順序
+
 const ALGO_COLORS = ["#e67e22", "#2980b9", "#27ae60"];  // greedy, tsp, dp
+const PREP_MIN = 0, PREP_MAX = 25;   // 製作時間範圍（分鐘）
+const WAIT_TOLERANCE_S = 180;        // 騎手在餐廳的等待容忍門檻（秒）
+
+// 新訂單的預設製作時間：5～20 分鐘隨機，讓示範更有變化
+function randomPrep() {
+  return Math.floor(5 + Math.random() * 16);
+}
 
 // ─── Leaflet 地圖初始化 ───────────────────────────────────────────────────────
 const cfg = window.MAP_CONFIG;
@@ -46,6 +55,58 @@ function makeIcon(color, label) {
 function updateCounts() {
   document.getElementById("count-pickup").textContent = pickupMarkers.length;
   document.getElementById("count-dropoff").textContent = dropoffMarkers.length;
+  renderPrepConfig();
+}
+
+// ─── 製作時間設定面板（依取餐點數量動態產生一列） ─────────────────────────────
+function renderPrepConfig() {
+  const list = document.getElementById("prep-list");
+  if (!list) return;
+  const n = pickupMarkers.length;
+
+  if (n === 0) {
+    prepTimes = [];
+    list.innerHTML =
+      '<p style="font-size:0.78rem;color:#aaa;">尚未新增取餐點。新增取餐點後即可設定其製作時間。</p>';
+    return;
+  }
+
+  // 為新出現的訂單填預設值；超出的丟棄
+  for (let i = 0; i < n; i++) {
+    if (typeof prepTimes[i] !== "number") prepTimes[i] = randomPrep();
+  }
+  prepTimes.length = n;
+
+  let html = "";
+  for (let i = 0; i < n; i++) {
+    const v = prepTimes[i];
+    html += `
+      <div class="prep-row">
+        <span class="prep-dot"></span>
+        <label>訂單 #${i + 1}</label>
+        <input type="range" min="${PREP_MIN}" max="${PREP_MAX}" step="1" value="${v}"
+               oninput="onPrepChange(${i}, this.value)" />
+        <input type="number" min="${PREP_MIN}" max="${PREP_MAX}" step="1" value="${v}"
+               id="prep-num-${i}" onchange="onPrepChange(${i}, this.value)" />
+        <span class="prep-unit">分鐘</span>
+      </div>`;
+  }
+  list.innerHTML = html;
+}
+
+// 製作時間變更：夾在 [0, 25]，同步同一列的 range 與 number 顯示
+function onPrepChange(i, raw) {
+  let v = Math.round(Number(raw));
+  if (!Number.isFinite(v)) v = 0;
+  v = Math.max(PREP_MIN, Math.min(PREP_MAX, v));
+  prepTimes[i] = v;
+  const row = document.querySelectorAll("#prep-list .prep-row")[i];
+  if (row) {
+    const range = row.querySelector('input[type="range"]');
+    const num = row.querySelector('input[type="number"]');
+    if (range) range.value = v;
+    if (num) num.value = v;
+  }
 }
 
 // ─── 模式切換 ────────────────────────────────────────────────────────────────
@@ -92,6 +153,7 @@ function clearAll() {
   pickupMarkers  = [];
   dropoffMarkers = [];
   startMarker    = null;
+  prepTimes      = [];
   updateCounts();
   clearRoutes();
   document.getElementById("results-area").innerHTML =
@@ -134,6 +196,9 @@ async function computeRoute() {
     dropoffs:  dropoffMarkers.map(o => [o.lat, o.lng]),
     start:     startMarker ? [startMarker.lat, startMarker.lng] : null,
     speed_mps: speedVal,
+    // 每筆訂單的製作時間（分鐘），長度對應取餐點數量
+    prep_times_min: pickupMarkers.map((_, i) =>
+      typeof prepTimes[i] === "number" ? prepTimes[i] : 0),
   };
 
   // 顯示載入中
@@ -219,6 +284,15 @@ function renderResults(data) {
             : `background:#fde8e8;color:#c0392b;">⚠ 有取餐／送餐點未能抵達，詳見下表「是否皆抵達」`)
         + `</p>`;
 
+  // 各訂單製作時間摘要（三演算法相同，取 base.orders_info）
+  if (base.orders_info && base.orders_info.length > 0) {
+    const items = base.orders_info
+      .map(o => `#${o.order_id}：${o.prep_time_min} 分`)
+      .join("　");
+    html += `<p style="font-size:0.78rem;color:#666;margin-bottom:10px;">`
+          + `🍳 餐點製作時間 — ${escHtml(items)}</p>`;
+  }
+
   // 路線圖例
   html += `<div id="route-legend"><h3>路線圖例</h3>`;
   results.forEach((r, i) => {
@@ -242,6 +316,7 @@ function renderResults(data) {
           <th>停靠接近距離</th>
           <th>總距離</th>
           <th>預估時間</th>
+          <th>騎手等待</th>
           <th>計算時間</th>
           <th>是否皆抵達</th>
         </tr>
@@ -256,6 +331,12 @@ function renderResults(data) {
     const apprStr = r.success ? `${Math.round(r.approach_distance_m)} 公尺` : dash;
     const totalStr = r.success ? fmtDist(r.total_distance_m) : dash;
     const timeStr = r.success ? fmtTime(r.total_time_s) : dash;
+    const waitStr = r.success
+      ? (fmtTime(r.total_wait_s)
+          + (r.exceeds_wait_tolerance
+              ? ' <span title="有取餐點等待超過 3 分鐘" style="color:#c0392b;">⚠</span>'
+              : ""))
+      : dash;
     const compStr = r.compute_ms.toFixed(2) + " 毫秒";
     const reachStr = r.success
       ? (r.all_stops_visited ? "✓ 全部抵達" : "✗ 未全抵達")
@@ -269,6 +350,7 @@ function renderResults(data) {
         <td>${apprStr}</td>
         <td>${totalStr}</td>
         <td>${timeStr}</td>
+        <td>${waitStr}</td>
         <td>${compStr}</td>
         <td>${reachStr}</td>
       </tr>`;

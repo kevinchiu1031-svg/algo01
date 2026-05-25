@@ -130,6 +130,16 @@ def api_route():
         return jsonify({"ok": False,
                         "error": "dropoffs 格式錯誤：須為 [[緯度, 經度], ...] 陣列"}), 400
 
+    # prep_times_min：各訂單餐點製作時間（分鐘）。None 由 compare_algorithms 視為全 0。
+    # 此處僅做形狀檢查（數字陣列）；長度與 0～25 範圍交由 compare_algorithms 把關。
+    prep_raw = body.get("prep_times_min", None)
+    if prep_raw is not None and (
+        not isinstance(prep_raw, list)
+        or not all(isinstance(v, (int, float)) for v in prep_raw)
+    ):
+        return jsonify({"ok": False,
+                        "error": "prep_times_min 格式錯誤：須為數字陣列（分鐘）"}), 400
+
     try:
         speed_mps = float(speed_raw)
 
@@ -142,7 +152,7 @@ def api_route():
         start    = tuple(start_raw) if start_raw is not None else None
 
         results: list[AlgoResult] = compare_algorithms(
-            graph, dist, pickups, dropoffs, start, speed_mps
+            graph, dist, pickups, dropoffs, start, speed_mps, prep_raw
         )
 
         analysis_text = chinese_analysis(results)

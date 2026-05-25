@@ -4,6 +4,28 @@ from delivery.algorithms.dp import DpDispatcher
 from delivery.algorithms.tsp_approx import TspApproxDispatcher
 
 
+def test_greedy_avoids_long_wait_at_restaurant(dist_factory):
+    """Wait-aware：最近的取餐點餐還沒好（要等很久），較遠的取餐點餐已好，
+    貪婪應先去『餐已好』的那家，避免在餐廳長時間空等。"""
+    # order 1 餐廳近（10s）但備餐久（ready 在 600s）；order 2 餐廳遠（60s）但餐已好（ready 0）
+    o1 = Order(id=1, restaurant_node=1, customer_node=2,
+               place_time=0.0, prep_time=600.0)
+    o2 = Order(id=2, restaurant_node=3, customer_node=4,
+               place_time=0.0, prep_time=0.0)
+    state = DriverState(location_node=0, current_time=0.0, in_hand=[
+        Stop(1, "pickup", 1), Stop(1, "dropoff", 2),
+    ])
+    dist = dist_factory({
+        (0, 1): 10, (0, 2): 70, (0, 3): 60, (0, 4): 90,
+        (1, 2): 50, (1, 3): 55, (1, 4): 80,
+        (2, 3): 40, (2, 4): 45, (3, 4): 50,
+    })
+    disp = GreedyDispatcher()
+    decision = disp.plan(state, o2, {1: o1, 2: o2}, dist)
+    # 第一個停靠點應是 order 2 的 pickup（餐已好），而非最近但要久等的 order 1
+    assert decision.new_route[0] == Stop(2, "pickup", 3)
+
+
 def test_greedy_single_new_order_no_in_hand(dist_factory):
     """空車情境：接一張新單，應排成 pickup → dropoff。"""
     order = Order(id=1, restaurant_node=10, customer_node=20,

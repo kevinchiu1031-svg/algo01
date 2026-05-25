@@ -156,6 +156,38 @@
       border: 2px solid rgba(0,0,0,0.3);
     }
 
+    /* 訂單製作時間設定 */
+    #order-config {
+      padding: 10px 14px;
+      background: #fffdf6;
+      border-bottom: 1px solid #eee;
+    }
+    #order-config h3 { font-size: 0.9rem; color: #555; margin-bottom: 6px; }
+    #order-config .hint-small {
+      font-size: 0.72rem; color: #999; margin-bottom: 8px;
+    }
+    .prep-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+      font-size: 0.8rem;
+      color: #444;
+    }
+    .prep-row label { flex: 1; }
+    .prep-row .prep-dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      background: #e67e22; flex-shrink: 0;
+      border: 2px solid rgba(0,0,0,0.25);
+    }
+    .prep-row input[type="range"] { flex: 2; }
+    .prep-row input[type="number"] {
+      width: 56px; padding: 3px 5px;
+      border: 1px solid #ccc; border-radius: 4px;
+      font-size: 0.8rem;
+    }
+    .prep-row .prep-unit { color: #888; font-size: 0.74rem; }
+
     /* 錯誤橫幅 */
     #error-banner {
       display: none;
@@ -324,6 +356,15 @@
       <div class="legend-item">
         <div class="legend-dot" style="background:#2c3e50;"></div>
         <span>司機起點</span>
+      </div>
+    </div>
+
+    <!-- 訂單製作時間設定（依取餐點數量動態產生） -->
+    <div id="order-config">
+      <h3>🍳 餐點製作時間</h3>
+      <div class="hint-small">每筆訂單可設定 0～25 分鐘；騎手在餐廳最多容忍等待 3 分鐘。</div>
+      <div id="prep-list">
+        <p style="font-size:0.78rem;color:#aaa;">尚未新增取餐點。新增取餐點後即可設定其製作時間。</p>
       </div>
     </div>
 
